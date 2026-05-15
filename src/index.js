@@ -36,6 +36,39 @@ const jitter = () => MIN_DELAY + Math.floor(Math.random() * (MAX_DELAY - MIN_DEL
  */
 const accounts = new Map();
 
+/**
+ * Pending login clients: accountId -> { client, expiresAt }
+ * Sign-in нужно завершить на ТОМ ЖЕ клиенте (auth_key), что и SendCode/SignIn,
+ * иначе CheckPassword не пройдёт. Держим клиент живым между шагами.
+ */
+const pendingLoginClients = new Map();
+const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000;
+
+async function getOrCreateLoginClient(accountId, sessionString = "") {
+  const existing = pendingLoginClients.get(accountId);
+  if (existing && existing.expiresAt > Date.now()) {
+    return existing.client;
+  }
+  if (existing) {
+    await existing.client.disconnect().catch(() => {});
+    pendingLoginClients.delete(accountId);
+  }
+  const client = await newClient(sessionString || "");
+  await client.connect();
+  pendingLoginClients.set(accountId, {
+    client,
+    expiresAt: Date.now() + PENDING_LOGIN_TTL_MS,
+  });
+  return client;
+}
+
+async function disposeLoginClient(accountId) {
+  const entry = pendingLoginClients.get(accountId);
+  if (!entry) return;
+  pendingLoginClients.delete(accountId);
+  await entry.client.disconnect().catch(() => {});
+}
+
 function log(accountId, level, event, data) {
   const tag = accountId ? accountId.slice(0, 8) : "----";
   console.log(`[${level}][${tag}] ${event}`, data || "");
@@ -95,8 +128,9 @@ async function startConnectedClient(state, account) {
 
 async function handleLoginRequested(account) {
   log(account.id, "info", "sending_code", { phone: account.phone });
-  const client = await newClient("");
-  await client.connect();
+  // Сбрасываем предыдущую попытку логина (если была)
+  await disposeLoginClient(account.id);
+  const client = await getOrCreateLoginClient(account.id);
   try {
     const result = await client.invoke(
       new Api.auth.SendCode({
@@ -113,19 +147,19 @@ async function handleLoginRequested(account) {
     await api.updateAccount({
       account_id: account.id,
       status: "code_sent",
+      session_string: client.session.save(),
       pending_phone_code_hash: result.phoneCodeHash,
       last_error: null,
     });
     log(account.id, "info", "code_sent", null);
   } catch (e) {
+    await disposeLoginClient(account.id);
     await api.updateAccount({
       account_id: account.id,
       status: "error",
       last_error: `sendCode: ${e.message}`,
     });
     log(account.id, "error", "send_code_failed", { error: e.message });
-  } finally {
-    await client.disconnect().catch(() => {});
   }
 }
 
@@ -139,8 +173,20 @@ async function handleCodeSubmitted(account) {
     });
     return;
   }
-  const client = await newClient("");
-  await client.connect();
+  // ВАЖНО: используем тот же auth_key, что слал код. Если воркер перезапускался,
+  // восстанавливаем временную StringSession из БД, а не создаём пустую сессию.
+  const entry = pendingLoginClients.get(account.id);
+  if ((!entry || entry.expiresAt <= Date.now()) && !account.session_string) {
+    await api.updateAccount({
+      account_id: account.id,
+      status: "error",
+      last_error: "Сессия логина истекла, нажми «Заново»",
+      clear_pending_code: true,
+      clear_phone_code_hash: true,
+    });
+    return;
+  }
+  const client = await getOrCreateLoginClient(account.id, account.session_string || "");
   try {
     await client.invoke(
       new Api.auth.SignIn({
@@ -149,7 +195,7 @@ async function handleCodeSubmitted(account) {
         phoneCode: account.pending_code,
       }),
     );
-    // Success
+    // Success без 2FA
     const sessionString = client.session.save();
     await api.updateAccount({
       account_id: account.id,
@@ -160,16 +206,20 @@ async function handleCodeSubmitted(account) {
       last_error: null,
     });
     log(account.id, "info", "logged_in", null);
+    await disposeLoginClient(account.id);
   } catch (e) {
     if (String(e.message || e.errorMessage || "").includes("SESSION_PASSWORD_NEEDED")) {
       await api.updateAccount({
         account_id: account.id,
         status: "password_required",
+        session_string: client.session.save(),
         clear_pending_code: true,
         last_error: null,
       });
       log(account.id, "info", "password_required", null);
+      // Клиент НЕ закрываем — нужен для CheckPassword
     } else {
+      await disposeLoginClient(account.id);
       await api.updateAccount({
         account_id: account.id,
         status: "error",
@@ -178,14 +228,21 @@ async function handleCodeSubmitted(account) {
       });
       log(account.id, "error", "sign_in_failed", { error: e.message });
     }
-  } finally {
-    await client.disconnect().catch(() => {});
   }
 }
 
 async function handlePasswordSubmitted(account) {
-  const client = await newClient("");
-  await client.connect();
+  const entry = pendingLoginClients.get(account.id);
+  if ((!entry || entry.expiresAt <= Date.now()) && !account.session_string) {
+    await api.updateAccount({
+      account_id: account.id,
+      status: "error",
+      last_error: "Сессия логина истекла, нажми «Заново»",
+      clear_pending_password: true,
+    });
+    return;
+  }
+  const client = await getOrCreateLoginClient(account.id, account.session_string || "");
   try {
     const pwd = await client.invoke(new Api.account.GetPassword());
     const check = await computeCheck(pwd, account.pending_password);
@@ -200,16 +257,17 @@ async function handlePasswordSubmitted(account) {
       last_error: null,
     });
     log(account.id, "info", "logged_in_2fa", null);
+    await disposeLoginClient(account.id);
   } catch (e) {
+    // Не закрываем клиент — пусть пользователь введёт пароль ещё раз
     await api.updateAccount({
       account_id: account.id,
-      status: "error",
+      status: "password_required",
+      session_string: client.session.save(),
       last_error: `2fa: ${e.message || e.errorMessage}`,
       clear_pending_password: true,
     });
     log(account.id, "error", "password_failed", { error: e.message });
-  } finally {
-    await client.disconnect().catch(() => {});
   }
 }
 
