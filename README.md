@@ -24,14 +24,4 @@ npm start
 
 После запуска иди в `/admin/telegram` → добавь аккаунт → введи код в открывшемся окне.
 
-## Деплой на Railway
 
-1. Залей `worker/` в GitHub
-2. Railway → New → Deploy from GitHub → выбрать репо (Root Directory: `worker`)
-3. Variables:
-   - `TELEGRAM_API_ID` = 27844448
-   - `TELEGRAM_API_HASH` = e33633be38924a65b804cf1de0ed4da3
-   - `LOVABLE_BASE_URL` = https://project--15652356-1a08-4abe-9947-e17a89727138.lovable.app
-   - `WORKER_SECRET` = твой секрет
-4. Start command: `npm start`
-5. Готово. Дальше всё через админку — просто добавляй аккаунты, воркер сам их подхватит.
