@@ -42,6 +42,7 @@ export const api = {
     firstName: payload.first_name,
     lastName: payload.last_name,
     text: payload.text,
+    telegramMessageId: payload.telegram_message_id != null ? String(payload.telegram_message_id) : null,
   }),
   inboundReaction: (payload) => call("/api/public/worker/inbound", {
     kind: "reaction",

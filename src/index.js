@@ -338,7 +338,12 @@ async function processSendQueue(account, state) {
           }));
         } catch {}
         await sleep(typingMs);
-        const sent = await state.client.sendMessage(entity, { message: text });
+        const sendOpts = { message: text };
+        if (item.replyToMessageId) {
+          // Отвечаем цитатой на исходное сообщение собеседника
+          sendOpts.replyTo = Number(item.replyToMessageId);
+        }
+        const sent = await state.client.sendMessage(entity, sendOpts);
         await api.ack(item.queueId, true, null, entity?.id ? String(entity.id) : null);
         log(account.id, "info", "sent", {
           to: item.target?.username || item.target?.telegramUserId || item.target?.phone,
