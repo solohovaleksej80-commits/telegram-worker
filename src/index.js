@@ -272,8 +272,9 @@ async function handlePasswordSubmitted(account) {
 }
 
 async function resolveContact(client, c) {
+  if (!c) throw new Error("contact is missing");
   if (c.username) return await client.getEntity(c.username);
-  if (c.telegram_user_id) return await client.getEntity(BigInt(c.telegram_user_id));
+  if (c.telegramUserId) return await client.getEntity(BigInt(c.telegramUserId));
   if (c.phone) return await client.getEntity(c.phone);
   throw new Error("contact has no username/user_id/phone");
 }
@@ -285,16 +286,16 @@ async function processSendQueue(account, state) {
     const { items } = await api.pull(account.id, 5);
     for (const item of items || []) {
       try {
-        const entity = await resolveContact(state.client, item.contact);
+        const entity = await resolveContact(state.client, item.target);
         await sleep(jitter());
         const sent = await state.client.sendMessage(entity, { message: item.content });
-        await api.ack(item.id, true, null, String(sent.id));
+        await api.ack(item.queueId, true, null, entity?.id ? String(entity.id) : null);
         log(account.id, "info", "sent", {
-          to: item.contact.username || item.contact.telegram_user_id,
+          to: item.target?.username || item.target?.telegramUserId || item.target?.phone,
         });
       } catch (err) {
-        await api.ack(item.id, false, err.message || String(err), null);
-        log(account.id, "error", "send_failed", { id: item.id, error: err.message });
+        await api.ack(item.queueId, false, err.message || String(err), null);
+        log(account.id, "error", "send_failed", { id: item.queueId, error: err.message });
       }
     }
   } catch (e) {
@@ -405,7 +406,7 @@ process.on("SIGTERM", async () => {
   console.log("Shutting down...");
   for (const [id, state] of accounts.entries()) {
     if (state.client) {
-      await api.heartbeat(id, "offline").catch(() => {});
+      await api.heartbeat(id, "disconnected").catch(() => {});
       await state.client.disconnect().catch(() => {});
     }
   }

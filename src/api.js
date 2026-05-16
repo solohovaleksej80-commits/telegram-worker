@@ -25,17 +25,24 @@ export const api = {
   accounts: () => call("/api/public/worker/accounts", {}),
   updateAccount: (payload) => call("/api/public/worker/account-update", payload),
   heartbeat: (accountId, status = "connected") =>
-    call("/api/public/worker/heartbeat", { account_id: accountId, status }),
+    call("/api/public/worker/heartbeat", { accountId, status }),
   pull: (accountId, limit = 5) =>
-    call("/api/public/worker/pull", { account_id: accountId, limit }),
-  ack: (messageId, success, error, telegramMessageId) =>
+    call("/api/public/worker/pull", { accountId, limit }),
+  ack: (queueId, success, error, resolvedTelegramUserId) =>
     call("/api/public/worker/ack", {
-      message_id: messageId,
+      queueId,
       success,
       error,
-      telegram_message_id: telegramMessageId,
+      resolvedTelegramUserId,
     }),
-  inbound: (payload) => call("/api/public/worker/inbound", payload),
+  inbound: (payload) => call("/api/public/worker/inbound", {
+    accountId: payload.account_id,
+    telegramUserId: payload.telegram_user_id,
+    username: payload.username,
+    firstName: payload.first_name,
+    lastName: payload.last_name,
+    text: payload.text,
+  }),
   log: (accountId, level, event, data) =>
-    call("/api/public/worker/log", { account_id: accountId, level, event, data }),
+    call("/api/public/worker/log", { accountId, level, event, data }),
 };
