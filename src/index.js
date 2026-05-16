@@ -113,6 +113,46 @@ async function startConnectedClient(state, account) {
     }
   }, new NewMessage({ incoming: true }));
 
+  // listen for reactions on our messages in private chats (raw updates)
+  client.addEventHandler(async (update) => {
+    if (!update || update.className !== "UpdateMessageReactions") return;
+    const peer = update.peer;
+    if (!peer || peer.className !== "PeerUser") return; // только личка
+    const userIdStr = String(peer.userId);
+    const results = update.reactions?.results || [];
+    // Берём последнюю реакцию (обычно она и есть только что поставленная)
+    const emojis = results
+      .map((r) => {
+        const reaction = r.reaction;
+        if (!reaction) return null;
+        if (reaction.emoticon) return reaction.emoticon;
+        if (reaction.documentId) return "✨"; // кастомный эмодзи / стикер-реакция
+        return null;
+      })
+      .filter(Boolean);
+    if (emojis.length === 0) {
+      // Реакция снята — игнорируем
+      return;
+    }
+    const emoji = emojis[emojis.length - 1];
+    let sender = null;
+    try { sender = await client.getEntity(BigInt(userIdStr)); } catch {}
+    try {
+      await api.inboundReaction({
+        account_id: account.id,
+        telegram_user_id: userIdStr,
+        username: sender?.username || null,
+        first_name: sender?.firstName || null,
+        last_name: sender?.lastName || null,
+        emoji,
+        msg_id: update.msgId,
+      });
+      log(account.id, "info", "reaction_received", { from: userIdStr, emoji });
+    } catch (e) {
+      log(account.id, "error", "reaction_inbound_failed", { error: e.message });
+    }
+  });
+
   log(account.id, "info", "connected", {
     username: me.username,
     user_id: String(me.id),

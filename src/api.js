@@ -43,6 +43,16 @@ export const api = {
     lastName: payload.last_name,
     text: payload.text,
   }),
+  inboundReaction: (payload) => call("/api/public/worker/inbound", {
+    kind: "reaction",
+    accountId: payload.account_id,
+    telegramUserId: payload.telegram_user_id,
+    username: payload.username,
+    firstName: payload.first_name,
+    lastName: payload.last_name,
+    emoji: payload.emoji,
+    msgId: payload.msg_id != null ? String(payload.msg_id) : null,
+  }),
   log: (accountId, level, event, data) =>
     call("/api/public/worker/log", { accountId, level, event, data }),
 };
