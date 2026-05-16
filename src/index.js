@@ -287,8 +287,18 @@ async function processSendQueue(account, state) {
     for (const item of items || []) {
       try {
         const entity = await resolveContact(state.client, item.target);
-        await sleep(jitter());
-        const sent = await state.client.sendMessage(entity, { message: item.content });
+        // Показываем "печатает..." и держим его, пока имитируем набор текста.
+        // Скорость ~ как у обычного человека: ~70 мс на символ, 1.5..8 сек.
+        const text = item.content || "";
+        const typingMs = Math.min(8000, Math.max(1500, text.length * 70));
+        try {
+          await state.client.invoke(new Api.messages.SetTyping({
+            peer: entity,
+            action: new Api.SendMessageTypingAction(),
+          }));
+        } catch {}
+        await sleep(typingMs);
+        const sent = await state.client.sendMessage(entity, { message: text });
         await api.ack(item.queueId, true, null, entity?.id ? String(entity.id) : null);
         log(account.id, "info", "sent", {
           to: item.target?.username || item.target?.telegramUserId || item.target?.phone,
