@@ -98,6 +98,10 @@ async function startConnectedClient(state, account) {
     const m = event.message;
     if (!m || m.out) return;
     const sender = await m.getSender().catch(() => null);
+    // Detect reply to OUR Telegram story (MessageReplyStoryHeader has storyId)
+    const replyTo = m.replyTo;
+    const isStoryReply = !!(replyTo && (replyTo.className === "MessageReplyStoryHeader" || replyTo.storyId));
+    const storyId = isStoryReply ? String(replyTo.storyId ?? "") : null;
     try {
       await api.inbound({
         account_id: account.id,
@@ -107,6 +111,8 @@ async function startConnectedClient(state, account) {
         last_name: sender?.lastName || null,
         text: m.message || "",
         telegram_message_id: String(m.id),
+        reply_to_story: isStoryReply,
+        story_id: storyId,
       });
     } catch (e) {
       log(account.id, "error", "inbound_failed", { error: e.message });
