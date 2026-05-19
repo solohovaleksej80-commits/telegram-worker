@@ -129,6 +129,45 @@ async function startConnectedClient(state, account) {
     }
   }, new NewMessage({ incoming: true }));
 
+  // listen for OUTGOING messages in private chats — to catch messages the admin
+  // sends manually from Telegram (cold first-touch spam, manual takeover, etc).
+  // Our own bot-sent messages are deduplicated via state.selfSentMsgIds, set
+  // right after client.sendMessage() in processSendQueue.
+  client.addEventHandler(async (event) => {
+    const m = event.message;
+    if (!m || !m.out) return;
+    if (!m.message) return; // skip non-text (stickers, media without caption)
+    // Private chat only — recipient is a single user (PeerUser).
+    const peerId = m.peerId;
+    if (!peerId || peerId.className !== "PeerUser") return;
+    // Dedupe: skip messages our worker itself just sent through the queue.
+    if (state.selfSentMsgIds && state.selfSentMsgIds.has(Number(m.id))) {
+      state.selfSentMsgIds.delete(Number(m.id));
+      return;
+    }
+    const userIdStr = String(peerId.userId);
+    let recipient = null;
+    try { recipient = await client.getEntity(BigInt(userIdStr)); } catch {}
+    try {
+      await api.outbound({
+        account_id: account.id,
+        telegram_user_id: userIdStr,
+        username: recipient?.username || null,
+        first_name: recipient?.firstName || null,
+        last_name: recipient?.lastName || null,
+        text: m.message,
+        telegram_message_id: String(m.id),
+      });
+      log(account.id, "info", "manual_outbound_captured", {
+        to: recipient?.username || userIdStr,
+        len: m.message.length,
+      });
+    } catch (e) {
+      log(account.id, "error", "outbound_capture_failed", { error: e.message });
+    }
+  }, new NewMessage({ outgoing: true }));
+
+
   // listen for reactions on our messages in private chats (raw updates)
   client.addEventHandler(async (update) => {
     if (!update || update.className !== "UpdateMessageReactions") return;
@@ -360,6 +399,13 @@ async function processSendQueue(account, state) {
           sendOpts.replyTo = Number(item.replyToMessageId);
         }
         const sent = await state.client.sendMessage(entity, sendOpts);
+        // Remember this msg id so the outgoing-handler dedupes it
+        if (sent?.id != null) {
+          if (!state.selfSentMsgIds) state.selfSentMsgIds = new Set();
+          state.selfSentMsgIds.add(Number(sent.id));
+          // safety TTL: drop after 60s in case the outgoing event never fires
+          setTimeout(() => state.selfSentMsgIds?.delete(Number(sent.id)), 60_000);
+        }
         await api.ack(item.queueId, true, null, entity?.id ? String(entity.id) : null);
         log(account.id, "info", "sent", {
           to: item.target?.username || item.target?.telegramUserId || item.target?.phone,
