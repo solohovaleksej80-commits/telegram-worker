@@ -93,6 +93,16 @@ async function startConnectedClient(state, account) {
   state.client = client;
   state.me = me;
 
+  // Прогреваем поток updates: gramjs может не начать получать NewMessage,
+  // пока не запросишь начальный state. Без этого только что подключённая
+  // сессия молчит на входящие, даже если heartbeat живой.
+  try {
+    await client.getDialogs({ limit: 1 });
+  } catch (e) {
+    log(account.id, "warn", "warmup_dialogs_failed", { error: e.message });
+  }
+
+
   // listen for incoming messages
   client.addEventHandler(async (event) => {
     const m = event.message;
