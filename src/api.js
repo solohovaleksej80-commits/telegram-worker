@@ -28,12 +28,13 @@ export const api = {
     call("/api/public/worker/heartbeat", { accountId, status }),
   pull: (accountId, limit = 5) =>
     call("/api/public/worker/pull", { accountId, limit }),
-  ack: (queueId, success, error, resolvedTelegramUserId) =>
+  ack: (queueId, success, error, resolvedTelegramUserId, spamBotResult) =>
     call("/api/public/worker/ack", {
       queueId,
       success,
       error,
       resolvedTelegramUserId,
+      spamBotResult: spamBotResult || undefined,
     }),
   inbound: (payload) => call("/api/public/worker/inbound", {
     accountId: payload.account_id,

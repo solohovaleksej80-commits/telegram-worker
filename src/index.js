@@ -374,6 +374,81 @@ async function resolveContact(client, c) {
   throw new Error("contact has no username/user_id/phone");
 }
 
+/** Признаки спам-блока в ошибке от Telegram */
+function isSpamBlockError(err) {
+  if (!err) return false;
+  const s = String(err).toUpperCase();
+  return (
+    s.includes("PEER_FLOOD") ||
+    s.includes("FLOOD_WAIT") ||
+    s.includes("USERS_TOO_MUCH") ||
+    s.includes("SPAM") ||
+    s.includes("PRIVACY_RESTRICTED")
+  );
+}
+
+const SPAMBOT_FREE_RE = /(no limits|no longer limited|now free|good news|all restrictions.*lifted|больше не ограничен|снят[оы]|свободен)/i;
+const SPAMBOT_BLOCKED_RE = /(unfortunately|sorry|our system|temporarily restricted|cannot send|ограничен|временно)/i;
+const SPAMBOT_COOLDOWN_MS = 30 * 60 * 1000; // не дёргаем @SpamBot чаще раза в 30 мин
+
+async function readLastSpamBotText(client, bot) {
+  try {
+    const msgs = await client.getMessages(bot, { limit: 1 });
+    return msgs?.[0]?.message || "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Пытаемся снять спам-блок через @SpamBot: /start, ждём ответ, если бот говорит
+ * что ограничения есть — пробуем второй раз. Больше двух раз не спамим.
+ * Возвращает: "unblocked" | "still_blocked" | "unknown" | "cooldown".
+ */
+async function tryUnblockViaSpamBot(state, accountId) {
+  const now = Date.now();
+  if (state.lastSpamBotAt && now - state.lastSpamBotAt < SPAMBOT_COOLDOWN_MS) {
+    return "cooldown";
+  }
+  state.lastSpamBotAt = now;
+  const client = state.client;
+  if (!client) return "unknown";
+
+  let bot;
+  try {
+    bot = await client.getEntity("SpamBot");
+  } catch (e) {
+    log(accountId, "warn", "spambot_resolve_failed", { error: e.message });
+    return "unknown";
+  }
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await client.sendMessage(bot, { message: "/start" });
+      log(accountId, "info", "spambot_start_sent", { attempt });
+    } catch (e) {
+      log(accountId, "error", "spambot_start_failed", { attempt, error: e.message });
+      return "unknown";
+    }
+    // Ждём ответ — поллим до 8 секунд
+    let text = "";
+    for (let i = 0; i < 8; i++) {
+      await sleep(1000);
+      text = await readLastSpamBotText(client, bot);
+      if (text) break;
+    }
+    log(accountId, "info", "spambot_reply", { attempt, text: text.slice(0, 200) });
+    if (!text) return "unknown";
+    if (SPAMBOT_FREE_RE.test(text)) return "unblocked";
+    if (!SPAMBOT_BLOCKED_RE.test(text)) {
+      // Текст непонятный — не повторяем, считаем неизвестным
+      return "unknown";
+    }
+    // Если первый /start не помог — пробуем ещё раз. После второго — стоп.
+  }
+  return "still_blocked";
+}
+
 async function processSendQueue(account, state) {
   if (state.pulling || !state.client) return;
   state.pulling = true;
@@ -411,8 +486,19 @@ async function processSendQueue(account, state) {
           to: item.target?.username || item.target?.telegramUserId || item.target?.phone,
         });
       } catch (err) {
-        await api.ack(item.queueId, false, err.message || String(err), null);
-        log(account.id, "error", "send_failed", { id: item.queueId, error: err.message });
+        const errText = err.message || String(err);
+        let spamBotResult = null;
+        if (isSpamBlockError(errText)) {
+          log(account.id, "warn", "spam_block_detected", { error: errText });
+          spamBotResult = await tryUnblockViaSpamBot(state, account.id);
+          log(account.id, "info", "spambot_result", { result: spamBotResult });
+        }
+        await api.ack(item.queueId, false, errText, null, spamBotResult);
+        log(account.id, "error", "send_failed", { id: item.queueId, error: errText, spamBotResult });
+        // Если @SpamBot подтвердил блок — нет смысла долбить остальные item-ы в пуле
+        if (spamBotResult === "still_blocked" || spamBotResult === "cooldown") {
+          break;
+        }
       }
     }
   } catch (e) {
