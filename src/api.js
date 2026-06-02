@@ -66,4 +66,6 @@ export const api = {
   }),
   log: (accountId, level, event, data) =>
     call("/api/public/worker/log", { accountId, level, event, data }),
+  harvestTargets: () => call("/api/public/worker/harvest-targets", {}),
+  harvestSubmit: (payload) => call("/api/public/worker/harvest-submit", payload),
 };

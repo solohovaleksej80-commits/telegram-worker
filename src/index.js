@@ -93,14 +93,16 @@ async function startConnectedClient(state, account) {
   state.client = client;
   state.me = me;
 
-  // Прогреваем поток updates: gramjs может не начать получать NewMessage,
-  // пока не запросишь начальный state. Без этого только что подключённая
-  // сессия молчит на входящие, даже если heartbeat живой.
+  // Прогреваем поток updates И populate-им entity-кэш (access_hash) для всех
+  // диалогов аккаунта. Без этого getEntity(BigInt(userId)) для контактов, с
+  // которыми бот ещё не переписывался через эту сессию, падает с
+  // "Could not find the input entity for PeerUser" — и ссылка не уходит.
   try {
-    await client.getDialogs({ limit: 1 });
+    await client.getDialogs({ limit: 200 });
   } catch (e) {
     log(account.id, "warn", "warmup_dialogs_failed", { error: e.message });
   }
+  state.lastDialogsRefreshAt = Date.now();
 
 
   // listen for incoming messages
@@ -366,10 +368,34 @@ async function handlePasswordSubmitted(account) {
   }
 }
 
-async function resolveContact(client, c) {
+async function resolveContact(client, c, state) {
   if (!c) throw new Error("contact is missing");
-  if (c.username) return await client.getEntity(c.username);
-  if (c.telegramUserId) return await client.getEntity(BigInt(c.telegramUserId));
+  // 1. По username — самый надёжный путь, не зависит от access_hash в кэше.
+  if (c.username) {
+    try { return await client.getEntity(c.username); } catch (e) {
+      if (!c.telegramUserId && !c.phone) throw e;
+    }
+  }
+  // 2. По user_id — требует access_hash в InMemorySession. Если его нет —
+  // обновляем диалоги (не чаще раза в 5 мин) и пробуем ещё раз.
+  if (c.telegramUserId) {
+    try {
+      return await client.getEntity(BigInt(c.telegramUserId));
+    } catch (e) {
+      const last = state?.lastDialogsRefreshAt || 0;
+      if (Date.now() - last > 5 * 60_000) {
+        try {
+          await client.getDialogs({ limit: 200 });
+          if (state) state.lastDialogsRefreshAt = Date.now();
+          return await client.getEntity(BigInt(c.telegramUserId));
+        } catch (e2) {
+          if (!c.phone) throw e2;
+        }
+      } else if (!c.phone) {
+        throw e;
+      }
+    }
+  }
   if (c.phone) return await client.getEntity(c.phone);
   throw new Error("contact has no username/user_id/phone");
 }
@@ -456,7 +482,7 @@ async function processSendQueue(account, state) {
     const { items } = await api.pull(account.id, 5);
     for (const item of items || []) {
       try {
-        const entity = await resolveContact(state.client, item.target);
+        const entity = await resolveContact(state.client, item.target, state);
         // Показываем "печатает..." и держим его, пока имитируем набор текста.
         // Скорость ~ как у обычного человека: ~70 мс на символ, 1.5..8 сек.
         const text = item.content || "";
@@ -582,6 +608,157 @@ async function pullAllQueues() {
   }
 }
 
+const HARVEST_INTERVAL_MS = Number(process.env.HARVEST_INTERVAL_MS || 120000);
+let harvesting = false;
+
+/** Извлекаем invite-hash из t.me/+hash или t.me/joinchat/hash */
+function parseInviteHash(link) {
+  const m = link.match(/(?:t\.me\/\+|t\.me\/joinchat\/|joinchat\/|^\+)([A-Za-z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+/** Нормализуем @username / t.me/username → username */
+function parsePublicUsername(link) {
+  const m = link.match(/(?:t\.me\/|@)?([A-Za-z][A-Za-z0-9_]{3,})$/);
+  return m ? m[1].replace(/^@/, "") : null;
+}
+
+/** Резолвим группу по ссылке; при инвайте пытаемся вступить, если ещё не внутри */
+async function resolveGroupEntity(client, link) {
+  const inviteHash = parseInviteHash(link);
+  if (inviteHash) {
+    try {
+      const info = await client.invoke(
+        new Api.messages.CheckChatInvite({ hash: inviteHash }),
+      );
+      if (info.chat) return info.chat; // уже участник
+    } catch {}
+    try {
+      const updates = await client.invoke(
+        new Api.messages.ImportChatInvite({ hash: inviteHash }),
+      );
+      const chat = updates?.chats?.[0];
+      if (chat) return chat;
+    } catch (e) {
+      throw new Error(`invite resolve failed: ${e.message}`);
+    }
+  }
+  const username = parsePublicUsername(link);
+  if (username) {
+    return await client.getEntity(username);
+  }
+  return await client.getEntity(link);
+}
+
+/** Имя содержит кириллицу (русское имя) */
+function hasRussianName(s) {
+  const name = `${s.firstName || ""} ${s.lastName || ""}`;
+  return /[а-яёА-ЯЁ]/.test(name);
+}
+
+/**
+ * Онлайн / был недавно (в пределах 2 суток).
+ * Telegram-статусы: UserStatusOnline, UserStatusRecently, UserStatusOffline (wasOnline),
+ * UserStatusLastWeek / UserStatusLastMonth / UserStatusEmpty.
+ */
+function isRecentlyOnline(s) {
+  const st = s?.status;
+  if (!st) return false;
+  const cn = st.className;
+  if (cn === "UserStatusOnline" || cn === "UserStatusRecently") return true;
+  if (cn === "UserStatusOffline" && st.wasOnline) {
+    const wasMs = Number(st.wasOnline) * 1000;
+    return Date.now() - wasMs <= 2 * 24 * 60 * 60 * 1000;
+  }
+  // UserStatusLastWeek / UserStatusLastMonth / UserStatusEmpty → не собираем
+  return false;
+}
+
+/** Приоритетный фильтр: русское имя + есть username + онлайн/недавно в сети */
+function passesHarvestFilter(s) {
+  if (!s.username) return false;
+  if (!hasRussianName(s)) return false;
+  if (!isRecentlyOnline(s)) return false;
+  return true;
+}
+
+async function harvestGroup(account, state, group) {
+  const client = state.client;
+  if (!client) return;
+  let title = null;
+  try {
+    const entity = await resolveGroupEntity(client, group.link);
+    title = entity?.title || group.link;
+
+    const limit = Math.min(3000, Math.max(50, group.messagesLimit || 500));
+    const seen = new Map(); // userId -> {username, first_name, last_name}
+    const messages = await client.getMessages(entity, { limit });
+    let scanned = 0;
+    let skipped = 0;
+    for (const m of messages) {
+      const s = m?.sender;
+      if (!s || s.className !== "User") continue;
+      if (s.bot || s.self) continue;
+      const uid = String(s.id);
+      if (seen.has(uid)) continue;
+      scanned++;
+      if (!passesHarvestFilter(s)) {
+        skipped++;
+        continue;
+      }
+      seen.set(uid, {
+        telegram_user_id: uid,
+        username: s.username || null,
+        first_name: s.firstName || null,
+        last_name: s.lastName || null,
+      });
+    }
+
+
+    const users = Array.from(seen.values());
+    // батчим по 500
+    for (let i = 0; i < users.length; i += 500) {
+      const chunk = users.slice(i, i + 500);
+      await api.harvestSubmit({
+        groupId: group.id,
+        title,
+        users: chunk,
+        done: i + 500 >= users.length,
+      });
+    }
+    if (users.length === 0) {
+      await api.harvestSubmit({ groupId: group.id, title, users: [], done: true });
+    }
+    log(account.id, "info", "harvest_done", { group: title, collected: users.length, scanned, skipped });
+  } catch (e) {
+    log(account.id, "error", "harvest_failed", { link: group.link, error: e.message });
+    await api.harvestSubmit({
+      groupId: group.id,
+      title,
+      users: [],
+      error: e.message.slice(0, 480),
+    }).catch(() => {});
+  }
+}
+
+async function harvestOnce() {
+  if (harvesting) return;
+  harvesting = true;
+  try {
+    const { groups } = await api.harvestTargets().catch(() => ({ groups: [] }));
+    for (const group of groups || []) {
+      const state = accounts.get(group.accountId);
+      if (!state?.client) continue;
+      await harvestGroup({ id: group.accountId }, state, group);
+      await sleep(jitter());
+    }
+  } catch (e) {
+    console.error("harvest error:", e.message);
+  } finally {
+    harvesting = false;
+  }
+}
+
 async function main() {
   console.log("Telegram worker started.");
   console.log("  base:", LOVABLE_BASE_URL);
@@ -599,6 +776,14 @@ async function main() {
     while (true) {
       await pullAllQueues().catch(() => {});
       await sleep(PULL_INTERVAL_MS);
+    }
+  })();
+
+  // Harvest loop — собираем активных авторов из указанных групп
+  (async () => {
+    while (true) {
+      await harvestOnce().catch((e) => console.error("harvest loop error:", e));
+      await sleep(HARVEST_INTERVAL_MS);
     }
   })();
 }
