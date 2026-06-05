@@ -43,7 +43,10 @@ export const api = {
     firstName: payload.first_name,
     lastName: payload.last_name,
     text: payload.text,
+    mediaType: payload.media_type || null,
     telegramMessageId: payload.telegram_message_id != null ? String(payload.telegram_message_id) : null,
+    reply_to_story: payload.reply_to_story,
+    story_id: payload.story_id,
   }),
   outbound: (payload) => call("/api/public/worker/outbound", {
     accountId: payload.account_id,

@@ -105,11 +105,45 @@ async function startConnectedClient(state, account) {
   state.lastDialogsRefreshAt = Date.now();
 
 
+  // Определяет тип медиа у сообщения без текста (голосовое/фото/стикер/кружок),
+  // чтобы сервер не ронял пустой текст и бот отвечал по-человечески.
+  function detectMediaType(m) {
+    if (!m || m.message) return null;
+    try {
+      if (m.voice) return "voice";
+      if (m.videoNote) return "video_note";
+      if (m.sticker) return "sticker";
+      if (m.gif) return "video";
+      if (m.video) return "video";
+      if (m.photo) return "photo";
+      if (m.document) return "document";
+      const media = m.media;
+      if (media) {
+        const cn = media.className || "";
+        if (cn === "MessageMediaPhoto") return "photo";
+        if (cn === "MessageMediaDocument") return "document";
+      }
+    } catch {}
+    return null;
+  }
+
   // listen for incoming messages
+
   client.addEventHandler(async (event) => {
     const m = event.message;
     if (!m || m.out) return;
+    // ЖЁСТКОЕ ПРАВИЛО: отвечаем ТОЛЬКО на сообщения в ЛИЧКЕ (PeerUser).
+    // Сообщения в группах/каналах (PeerChat/PeerChannel) — где аккаунт сидит
+    // ради сбора контактов — НИКОГДА не обрабатываем как входящие. Иначе бот
+    // видит, как люди переписываются в публичном чате, и начинает писать им
+    // первым. Спамим строго тех, кого собрали в базу (source='harvest'),
+    // и только по расписанию (утро/вечер). Здесь — отсечка чужих чатов.
+    const peerCn = m.peerId?.className;
+    if (peerCn && peerCn !== "PeerUser") return;
     const sender = await m.getSender().catch(() => null);
+    // Дополнительная защита: отправитель должен быть обычным пользователем,
+    // а не каналом/группой/ботом.
+    if (!sender || sender.className !== "User" || sender.bot) return;
     // Detect reply to OUR Telegram story (MessageReplyStoryHeader has storyId)
     const replyTo = m.replyTo;
     const isStoryReply = !!(replyTo && (replyTo.className === "MessageReplyStoryHeader" || replyTo.storyId));
@@ -122,6 +156,7 @@ async function startConnectedClient(state, account) {
         first_name: sender?.firstName || null,
         last_name: sender?.lastName || null,
         text: m.message || "",
+        media_type: detectMediaType(m),
         telegram_message_id: String(m.id),
         reply_to_story: isStoryReply,
         story_id: storyId,
