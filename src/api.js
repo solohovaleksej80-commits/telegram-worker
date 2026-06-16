@@ -2,17 +2,32 @@ import fetch from "node-fetch";
 
 const BASE = process.env.LOVABLE_BASE_URL;
 const SECRET = process.env.WORKER_SECRET;
+const API_TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 20000);
 
 async function call(path, body) {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${SECRET}`,
-    },
-    body: JSON.stringify(body || {}),
-  });
-  const text = await res.text();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  let res;
+  let text;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${SECRET}`,
+      },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal,
+    });
+    text = await res.text();
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      throw new Error(`API ${path} timeout after ${API_TIMEOUT_MS}ms`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   let data;
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
   if (!res.ok) {

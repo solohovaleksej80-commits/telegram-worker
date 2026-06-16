@@ -36,6 +36,39 @@ const jitter = () => MIN_DELAY + Math.floor(Math.random() * (MAX_DELAY - MIN_DEL
  */
 const accounts = new Map();
 
+/**
+ * Pending login clients: accountId -> { client, expiresAt }
+ * Sign-in нужно завершить на ТОМ ЖЕ клиенте (auth_key), что и SendCode/SignIn,
+ * иначе CheckPassword не пройдёт. Держим клиент живым между шагами.
+ */
+const pendingLoginClients = new Map();
+const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000;
+
+async function getOrCreateLoginClient(accountId, sessionString = "", proxy = null) {
+  const existing = pendingLoginClients.get(accountId);
+  if (existing && existing.expiresAt > Date.now()) {
+    return existing.client;
+  }
+  if (existing) {
+    await existing.client.disconnect().catch(() => {});
+    pendingLoginClients.delete(accountId);
+  }
+  const client = await newClient(sessionString || "", proxy);
+  await client.connect();
+  pendingLoginClients.set(accountId, {
+    client,
+    expiresAt: Date.now() + PENDING_LOGIN_TTL_MS,
+  });
+  return client;
+}
+
+async function disposeLoginClient(accountId) {
+  const entry = pendingLoginClients.get(accountId);
+  if (!entry) return;
+  pendingLoginClients.delete(accountId);
+  await entry.client.disconnect().catch(() => {});
+}
+
 function log(accountId, level, event, data) {
   const tag = accountId ? accountId.slice(0, 8) : "----";
   console.log(`[${level}][${tag}] ${event}`, data || "");
@@ -44,27 +77,117 @@ function log(accountId, level, event, data) {
   }
 }
 
-async function newClient(sessionString = "") {
+/**
+ * Сигнал о состоянии соединения аккаунта (вероятная пропажа/возврат прокси).
+ * Шлём на сервер только на ПЕРЕХОДАХ (down<->restored), чтобы не спамить
+ * HTTP-ом каждый цикл синхронизации. Идемпотентность дополнительно держится
+ * на сервере.
+ */
+function setConnAlert(account, state, kind, error) {
+  if (state.connAlert === kind) return;
+  state.connAlert = kind;
+  api.connectionAlert(account.id, kind, error).catch(() => {});
+}
+
+// Преобразует прокси из БД (host/port/username/password) в формат gramjs SOCKS5.
+function toGramProxy(proxy) {
+  if (!proxy || !proxy.host || !proxy.port) return undefined;
+  const p = {
+    ip: proxy.host,
+    port: Number(proxy.port),
+    socksType: 5,
+  };
+  if (proxy.username) p.username = proxy.username;
+  if (proxy.password) p.password = proxy.password;
+  return p;
+}
+
+async function newClient(sessionString = "", proxy = null) {
   const session = new StringSession(sessionString);
-  const client = new TelegramClient(session, apiId, apiHash, {
+  const gramProxy = toGramProxy(proxy);
+  const opts = {
     connectionRetries: 5,
     autoReconnect: true,
-  });
+  };
+  if (gramProxy) opts.proxy = gramProxy;
+  const client = new TelegramClient(session, apiId, apiHash, opts);
   return client;
 }
 
 async function startConnectedClient(state, account) {
-  const client = await newClient(account.session_string);
-  await client.connect();
-  const me = await client.getMe();
+  const client = await newClient(account.session_string, account.proxy);
+  let me;
+  try {
+    await client.connect();
+    me = await client.getMe();
+  } catch (e) {
+    // Не удалось подключиться — почти всегда это умерший/кончившийся прокси
+    // (трафик идёт через него). Сообщаем админу и пробуем ещё раз позже.
+    await client.disconnect().catch(() => {});
+    setConnAlert(account, state, "down", e.message);
+    throw e;
+  }
+  // Подключение живо — если до этого падало, сообщаем что прокси снова работает.
+  setConnAlert(account, state, "restored");
   state.client = client;
   state.me = me;
 
+
+  // Прогреваем поток updates И populate-им entity-кэш (access_hash) для всех
+  // диалогов аккаунта. Без этого getEntity(BigInt(userId)) для контактов, с
+  // которыми бот ещё не переписывался через эту сессию, падает с
+  // "Could not find the input entity for PeerUser" — и ссылка не уходит.
+  try {
+    await client.getDialogs({ limit: 200 });
+  } catch (e) {
+    log(account.id, "warn", "warmup_dialogs_failed", { error: e.message });
+  }
+  state.lastDialogsRefreshAt = Date.now();
+
+
+  // Определяет тип медиа у сообщения без текста (голосовое/фото/стикер/кружок),
+  // чтобы сервер не ронял пустой текст и бот отвечал по-человечески.
+  function detectMediaType(m) {
+    if (!m || m.message) return null;
+    try {
+      if (m.voice) return "voice";
+      if (m.videoNote) return "video_note";
+      if (m.sticker) return "sticker";
+      if (m.gif) return "video";
+      if (m.video) return "video";
+      if (m.photo) return "photo";
+      if (m.document) return "document";
+      const media = m.media;
+      if (media) {
+        const cn = media.className || "";
+        if (cn === "MessageMediaPhoto") return "photo";
+        if (cn === "MessageMediaDocument") return "document";
+      }
+    } catch {}
+    return null;
+  }
+
   // listen for incoming messages
+
   client.addEventHandler(async (event) => {
     const m = event.message;
     if (!m || m.out) return;
+    // ЖЁСТКОЕ ПРАВИЛО: отвечаем ТОЛЬКО на сообщения в ЛИЧКЕ (PeerUser).
+    // Сообщения в группах/каналах (PeerChat/PeerChannel) — где аккаунт сидит
+    // ради сбора контактов — НИКОГДА не обрабатываем как входящие. Иначе бот
+    // видит, как люди переписываются в публичном чате, и начинает писать им
+    // первым. Спамим строго тех, кого собрали в базу (source='harvest'),
+    // и только по расписанию (утро/вечер). Здесь — отсечка чужих чатов.
+    const peerCn = m.peerId?.className;
+    if (peerCn && peerCn !== "PeerUser") return;
     const sender = await m.getSender().catch(() => null);
+    // Дополнительная защита: отправитель должен быть обычным пользователем,
+    // а не каналом/группой/ботом.
+    if (!sender || sender.className !== "User" || sender.bot) return;
+    // Detect reply to OUR Telegram story (MessageReplyStoryHeader has storyId)
+    const replyTo = m.replyTo;
+    const isStoryReply = !!(replyTo && (replyTo.className === "MessageReplyStoryHeader" || replyTo.storyId));
+    const storyId = isStoryReply ? String(replyTo.storyId ?? "") : null;
     try {
       await api.inbound({
         account_id: account.id,
@@ -73,12 +196,94 @@ async function startConnectedClient(state, account) {
         first_name: sender?.firstName || null,
         last_name: sender?.lastName || null,
         text: m.message || "",
+        media_type: detectMediaType(m),
         telegram_message_id: String(m.id),
+        reply_to_story: isStoryReply,
+        story_id: storyId,
       });
     } catch (e) {
       log(account.id, "error", "inbound_failed", { error: e.message });
     }
   }, new NewMessage({ incoming: true }));
+
+  // listen for OUTGOING messages in private chats — to catch messages the admin
+  // sends manually from Telegram (cold first-touch spam, manual takeover, etc).
+  // Our own bot-sent messages are deduplicated via state.selfSentMsgIds, set
+  // right after client.sendMessage() in processSendQueue.
+  client.addEventHandler(async (event) => {
+    const m = event.message;
+    if (!m || !m.out) return;
+    if (!m.message) return; // skip non-text (stickers, media without caption)
+    // Private chat only — recipient is a single user (PeerUser).
+    const peerId = m.peerId;
+    if (!peerId || peerId.className !== "PeerUser") return;
+    // Dedupe: skip messages our worker itself just sent through the queue.
+    if (state.selfSentMsgIds && state.selfSentMsgIds.has(Number(m.id))) {
+      state.selfSentMsgIds.delete(Number(m.id));
+      return;
+    }
+    const userIdStr = String(peerId.userId);
+    let recipient = null;
+    try { recipient = await client.getEntity(BigInt(userIdStr)); } catch {}
+    try {
+      await api.outbound({
+        account_id: account.id,
+        telegram_user_id: userIdStr,
+        username: recipient?.username || null,
+        first_name: recipient?.firstName || null,
+        last_name: recipient?.lastName || null,
+        text: m.message,
+        telegram_message_id: String(m.id),
+      });
+      log(account.id, "info", "manual_outbound_captured", {
+        to: recipient?.username || userIdStr,
+        len: m.message.length,
+      });
+    } catch (e) {
+      log(account.id, "error", "outbound_capture_failed", { error: e.message });
+    }
+  }, new NewMessage({ outgoing: true }));
+
+
+  // listen for reactions on our messages in private chats (raw updates)
+  client.addEventHandler(async (update) => {
+    if (!update || update.className !== "UpdateMessageReactions") return;
+    const peer = update.peer;
+    if (!peer || peer.className !== "PeerUser") return; // только личка
+    const userIdStr = String(peer.userId);
+    const results = update.reactions?.results || [];
+    // Берём последнюю реакцию (обычно она и есть только что поставленная)
+    const emojis = results
+      .map((r) => {
+        const reaction = r.reaction;
+        if (!reaction) return null;
+        if (reaction.emoticon) return reaction.emoticon;
+        if (reaction.documentId) return "✨"; // кастомный эмодзи / стикер-реакция
+        return null;
+      })
+      .filter(Boolean);
+    if (emojis.length === 0) {
+      // Реакция снята — игнорируем
+      return;
+    }
+    const emoji = emojis[emojis.length - 1];
+    let sender = null;
+    try { sender = await client.getEntity(BigInt(userIdStr)); } catch {}
+    try {
+      await api.inboundReaction({
+        account_id: account.id,
+        telegram_user_id: userIdStr,
+        username: sender?.username || null,
+        first_name: sender?.firstName || null,
+        last_name: sender?.lastName || null,
+        emoji,
+        msg_id: update.msgId,
+      });
+      log(account.id, "info", "reaction_received", { from: userIdStr, emoji });
+    } catch (e) {
+      log(account.id, "error", "reaction_inbound_failed", { error: e.message });
+    }
+  });
 
   log(account.id, "info", "connected", {
     username: me.username,
@@ -95,8 +300,9 @@ async function startConnectedClient(state, account) {
 
 async function handleLoginRequested(account) {
   log(account.id, "info", "sending_code", { phone: account.phone });
-  const client = await newClient("");
-  await client.connect();
+  // Сбрасываем предыдущую попытку логина (если была)
+  await disposeLoginClient(account.id);
+  const client = await getOrCreateLoginClient(account.id, "", account.proxy);
   try {
     const result = await client.invoke(
       new Api.auth.SendCode({
@@ -113,19 +319,19 @@ async function handleLoginRequested(account) {
     await api.updateAccount({
       account_id: account.id,
       status: "code_sent",
+      session_string: client.session.save(),
       pending_phone_code_hash: result.phoneCodeHash,
       last_error: null,
     });
     log(account.id, "info", "code_sent", null);
   } catch (e) {
+    await disposeLoginClient(account.id);
     await api.updateAccount({
       account_id: account.id,
       status: "error",
       last_error: `sendCode: ${e.message}`,
     });
     log(account.id, "error", "send_code_failed", { error: e.message });
-  } finally {
-    await client.disconnect().catch(() => {});
   }
 }
 
@@ -139,8 +345,20 @@ async function handleCodeSubmitted(account) {
     });
     return;
   }
-  const client = await newClient("");
-  await client.connect();
+  // ВАЖНО: используем тот же auth_key, что слал код. Если воркер перезапускался,
+  // восстанавливаем временную StringSession из БД, а не создаём пустую сессию.
+  const entry = pendingLoginClients.get(account.id);
+  if ((!entry || entry.expiresAt <= Date.now()) && !account.session_string) {
+    await api.updateAccount({
+      account_id: account.id,
+      status: "error",
+      last_error: "Сессия логина истекла, нажми «Заново»",
+      clear_pending_code: true,
+      clear_phone_code_hash: true,
+    });
+    return;
+  }
+  const client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
   try {
     await client.invoke(
       new Api.auth.SignIn({
@@ -149,7 +367,7 @@ async function handleCodeSubmitted(account) {
         phoneCode: account.pending_code,
       }),
     );
-    // Success
+    // Success без 2FA
     const sessionString = client.session.save();
     await api.updateAccount({
       account_id: account.id,
@@ -160,16 +378,20 @@ async function handleCodeSubmitted(account) {
       last_error: null,
     });
     log(account.id, "info", "logged_in", null);
+    await disposeLoginClient(account.id);
   } catch (e) {
     if (String(e.message || e.errorMessage || "").includes("SESSION_PASSWORD_NEEDED")) {
       await api.updateAccount({
         account_id: account.id,
         status: "password_required",
+        session_string: client.session.save(),
         clear_pending_code: true,
         last_error: null,
       });
       log(account.id, "info", "password_required", null);
+      // Клиент НЕ закрываем — нужен для CheckPassword
     } else {
+      await disposeLoginClient(account.id);
       await api.updateAccount({
         account_id: account.id,
         status: "error",
@@ -178,14 +400,21 @@ async function handleCodeSubmitted(account) {
       });
       log(account.id, "error", "sign_in_failed", { error: e.message });
     }
-  } finally {
-    await client.disconnect().catch(() => {});
   }
 }
 
 async function handlePasswordSubmitted(account) {
-  const client = await newClient("");
-  await client.connect();
+  const entry = pendingLoginClients.get(account.id);
+  if ((!entry || entry.expiresAt <= Date.now()) && !account.session_string) {
+    await api.updateAccount({
+      account_id: account.id,
+      status: "error",
+      last_error: "Сессия логина истекла, нажми «Заново»",
+      clear_pending_password: true,
+    });
+    return;
+  }
+  const client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
   try {
     const pwd = await client.invoke(new Api.account.GetPassword());
     const check = await computeCheck(pwd, account.pending_password);
@@ -200,24 +429,125 @@ async function handlePasswordSubmitted(account) {
       last_error: null,
     });
     log(account.id, "info", "logged_in_2fa", null);
+    await disposeLoginClient(account.id);
   } catch (e) {
+    // Не закрываем клиент — пусть пользователь введёт пароль ещё раз
     await api.updateAccount({
       account_id: account.id,
-      status: "error",
+      status: "password_required",
+      session_string: client.session.save(),
       last_error: `2fa: ${e.message || e.errorMessage}`,
       clear_pending_password: true,
     });
     log(account.id, "error", "password_failed", { error: e.message });
-  } finally {
-    await client.disconnect().catch(() => {});
   }
 }
 
-async function resolveContact(client, c) {
-  if (c.username) return await client.getEntity(c.username);
-  if (c.telegram_user_id) return await client.getEntity(BigInt(c.telegram_user_id));
+async function resolveContact(client, c, state) {
+  if (!c) throw new Error("contact is missing");
+  // 1. По username — самый надёжный путь, не зависит от access_hash в кэше.
+  if (c.username) {
+    try { return await client.getEntity(c.username); } catch (e) {
+      if (!c.telegramUserId && !c.phone) throw e;
+    }
+  }
+  // 2. По user_id — требует access_hash в InMemorySession. Если его нет —
+  // обновляем диалоги (не чаще раза в 5 мин) и пробуем ещё раз.
+  if (c.telegramUserId) {
+    try {
+      return await client.getEntity(BigInt(c.telegramUserId));
+    } catch (e) {
+      const last = state?.lastDialogsRefreshAt || 0;
+      if (Date.now() - last > 5 * 60_000) {
+        try {
+          await client.getDialogs({ limit: 200 });
+          if (state) state.lastDialogsRefreshAt = Date.now();
+          return await client.getEntity(BigInt(c.telegramUserId));
+        } catch (e2) {
+          if (!c.phone) throw e2;
+        }
+      } else if (!c.phone) {
+        throw e;
+      }
+    }
+  }
   if (c.phone) return await client.getEntity(c.phone);
   throw new Error("contact has no username/user_id/phone");
+}
+
+/** Признаки спам-блока в ошибке от Telegram */
+function isSpamBlockError(err) {
+  if (!err) return false;
+  const s = String(err).toUpperCase();
+  return (
+    s.includes("PEER_FLOOD") ||
+    s.includes("FLOOD_WAIT") ||
+    s.includes("USERS_TOO_MUCH") ||
+    s.includes("SPAM") ||
+    s.includes("PRIVACY_RESTRICTED")
+  );
+}
+
+const SPAMBOT_FREE_RE = /(no limits|no longer limited|now free|good news|all restrictions.*lifted|больше не ограничен|снят[оы]|свободен)/i;
+const SPAMBOT_BLOCKED_RE = /(unfortunately|sorry|our system|temporarily restricted|cannot send|ограничен|временно)/i;
+const SPAMBOT_COOLDOWN_MS = 30 * 60 * 1000; // не дёргаем @SpamBot чаще раза в 30 мин
+
+async function readLastSpamBotText(client, bot) {
+  try {
+    const msgs = await client.getMessages(bot, { limit: 1 });
+    return msgs?.[0]?.message || "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Пытаемся снять спам-блок через @SpamBot: /start, ждём ответ, если бот говорит
+ * что ограничения есть — пробуем второй раз. Больше двух раз не спамим.
+ * Возвращает: "unblocked" | "still_blocked" | "unknown" | "cooldown".
+ */
+async function tryUnblockViaSpamBot(state, accountId) {
+  const now = Date.now();
+  if (state.lastSpamBotAt && now - state.lastSpamBotAt < SPAMBOT_COOLDOWN_MS) {
+    return "cooldown";
+  }
+  state.lastSpamBotAt = now;
+  const client = state.client;
+  if (!client) return "unknown";
+
+  let bot;
+  try {
+    bot = await client.getEntity("SpamBot");
+  } catch (e) {
+    log(accountId, "warn", "spambot_resolve_failed", { error: e.message });
+    return "unknown";
+  }
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await client.sendMessage(bot, { message: "/start" });
+      log(accountId, "info", "spambot_start_sent", { attempt });
+    } catch (e) {
+      log(accountId, "error", "spambot_start_failed", { attempt, error: e.message });
+      return "unknown";
+    }
+    // Ждём ответ — поллим до 8 секунд
+    let text = "";
+    for (let i = 0; i < 8; i++) {
+      await sleep(1000);
+      text = await readLastSpamBotText(client, bot);
+      if (text) break;
+    }
+    log(accountId, "info", "spambot_reply", { attempt, text: text.slice(0, 200) });
+    if (!text) return "unknown";
+    if (SPAMBOT_FREE_RE.test(text)) return "unblocked";
+    if (!SPAMBOT_BLOCKED_RE.test(text)) {
+      // Текст непонятный — не повторяем, считаем неизвестным
+      return "unknown";
+    }
+    // Если первый /start не помог — пробуем ещё раз. После второго — стоп.
+  }
+  return "still_blocked";
 }
 
 async function processSendQueue(account, state) {
@@ -227,16 +557,49 @@ async function processSendQueue(account, state) {
     const { items } = await api.pull(account.id, 5);
     for (const item of items || []) {
       try {
-        const entity = await resolveContact(state.client, item.contact);
-        await sleep(jitter());
-        const sent = await state.client.sendMessage(entity, { message: item.content });
-        await api.ack(item.id, true, null, String(sent.id));
+        const entity = await resolveContact(state.client, item.target, state);
+        // Показываем "печатает..." и держим его, пока имитируем набор текста.
+        // Скорость ~ как у обычного человека: ~70 мс на символ, 1.5..8 сек.
+        const text = item.content || "";
+        const typingMs = Math.min(8000, Math.max(1500, text.length * 70));
+        try {
+          await state.client.invoke(new Api.messages.SetTyping({
+            peer: entity,
+            action: new Api.SendMessageTypingAction(),
+          }));
+        } catch {}
+        await sleep(typingMs);
+        const sendOpts = { message: text };
+        if (item.replyToMessageId) {
+          // Отвечаем цитатой на исходное сообщение собеседника
+          sendOpts.replyTo = Number(item.replyToMessageId);
+        }
+        const sent = await state.client.sendMessage(entity, sendOpts);
+        // Remember this msg id so the outgoing-handler dedupes it
+        if (sent?.id != null) {
+          if (!state.selfSentMsgIds) state.selfSentMsgIds = new Set();
+          state.selfSentMsgIds.add(Number(sent.id));
+          // safety TTL: drop after 60s in case the outgoing event never fires
+          setTimeout(() => state.selfSentMsgIds?.delete(Number(sent.id)), 60_000);
+        }
+        await api.ack(item.queueId, true, null, entity?.id ? String(entity.id) : null);
         log(account.id, "info", "sent", {
-          to: item.contact.username || item.contact.telegram_user_id,
+          to: item.target?.username || item.target?.telegramUserId || item.target?.phone,
         });
       } catch (err) {
-        await api.ack(item.id, false, err.message || String(err), null);
-        log(account.id, "error", "send_failed", { id: item.id, error: err.message });
+        const errText = err.message || String(err);
+        let spamBotResult = null;
+        if (isSpamBlockError(errText)) {
+          log(account.id, "warn", "spam_block_detected", { error: errText });
+          spamBotResult = await tryUnblockViaSpamBot(state, account.id);
+          log(account.id, "info", "spambot_result", { result: spamBotResult });
+        }
+        await api.ack(item.queueId, false, errText, null, spamBotResult);
+        log(account.id, "error", "send_failed", { id: item.queueId, error: errText, spamBotResult });
+        // Если @SpamBot подтвердил блок — нет смысла долбить остальные item-ы в пуле
+        if (spamBotResult === "still_blocked" || spamBotResult === "cooldown") {
+          break;
+        }
       }
     }
   } catch (e) {
@@ -296,9 +659,19 @@ async function syncOnce() {
     }
 
     // Heartbeat for connected
-    if (state.client && Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
-      state.lastHeartbeat = Date.now();
-      api.heartbeat(account.id, "connected").catch(() => {});
+    if (state.client) {
+      // Если соединение разорвалось посреди сессии (умер прокси) — gramjs
+      // выставляет client.connected=false. Это тоже "пропажа прокси".
+      if (state.client.connected === false) {
+        setConnAlert(account, state, "down", "connection dropped");
+      } else if (state.connAlert === "down") {
+        // Авто-reconnect поднял соединение обратно.
+        setConnAlert(account, state, "restored");
+      }
+      if (Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
+        state.lastHeartbeat = Date.now();
+        api.heartbeat(account.id, "connected").catch(() => {});
+      }
     }
   }
 
@@ -317,6 +690,157 @@ async function pullAllQueues() {
     if (state?.client && (account.status === "connected" || account.status === "active")) {
       processSendQueue(account, state).catch(() => {});
     }
+  }
+}
+
+const HARVEST_INTERVAL_MS = Number(process.env.HARVEST_INTERVAL_MS || 120000);
+let harvesting = false;
+
+/** Извлекаем invite-hash из t.me/+hash или t.me/joinchat/hash */
+function parseInviteHash(link) {
+  const m = link.match(/(?:t\.me\/\+|t\.me\/joinchat\/|joinchat\/|^\+)([A-Za-z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+/** Нормализуем @username / t.me/username → username */
+function parsePublicUsername(link) {
+  const m = link.match(/(?:t\.me\/|@)?([A-Za-z][A-Za-z0-9_]{3,})$/);
+  return m ? m[1].replace(/^@/, "") : null;
+}
+
+/** Резолвим группу по ссылке; при инвайте пытаемся вступить, если ещё не внутри */
+async function resolveGroupEntity(client, link) {
+  const inviteHash = parseInviteHash(link);
+  if (inviteHash) {
+    try {
+      const info = await client.invoke(
+        new Api.messages.CheckChatInvite({ hash: inviteHash }),
+      );
+      if (info.chat) return info.chat; // уже участник
+    } catch {}
+    try {
+      const updates = await client.invoke(
+        new Api.messages.ImportChatInvite({ hash: inviteHash }),
+      );
+      const chat = updates?.chats?.[0];
+      if (chat) return chat;
+    } catch (e) {
+      throw new Error(`invite resolve failed: ${e.message}`);
+    }
+  }
+  const username = parsePublicUsername(link);
+  if (username) {
+    return await client.getEntity(username);
+  }
+  return await client.getEntity(link);
+}
+
+/** Имя содержит кириллицу (русское имя) */
+function hasRussianName(s) {
+  const name = `${s.firstName || ""} ${s.lastName || ""}`;
+  return /[а-яёА-ЯЁ]/.test(name);
+}
+
+/**
+ * Онлайн / был недавно (в пределах 2 суток).
+ * Telegram-статусы: UserStatusOnline, UserStatusRecently, UserStatusOffline (wasOnline),
+ * UserStatusLastWeek / UserStatusLastMonth / UserStatusEmpty.
+ */
+function isRecentlyOnline(s) {
+  const st = s?.status;
+  if (!st) return false;
+  const cn = st.className;
+  if (cn === "UserStatusOnline" || cn === "UserStatusRecently") return true;
+  if (cn === "UserStatusOffline" && st.wasOnline) {
+    const wasMs = Number(st.wasOnline) * 1000;
+    return Date.now() - wasMs <= 2 * 24 * 60 * 60 * 1000;
+  }
+  // UserStatusLastWeek / UserStatusLastMonth / UserStatusEmpty → не собираем
+  return false;
+}
+
+/** Приоритетный фильтр: русское имя + есть username + онлайн/недавно в сети */
+function passesHarvestFilter(s) {
+  if (!s.username) return false;
+  if (!hasRussianName(s)) return false;
+  if (!isRecentlyOnline(s)) return false;
+  return true;
+}
+
+async function harvestGroup(account, state, group) {
+  const client = state.client;
+  if (!client) return;
+  let title = null;
+  try {
+    const entity = await resolveGroupEntity(client, group.link);
+    title = entity?.title || group.link;
+
+    const limit = Math.min(3000, Math.max(50, group.messagesLimit || 500));
+    const seen = new Map(); // userId -> {username, first_name, last_name}
+    const messages = await client.getMessages(entity, { limit });
+    let scanned = 0;
+    let skipped = 0;
+    for (const m of messages) {
+      const s = m?.sender;
+      if (!s || s.className !== "User") continue;
+      if (s.bot || s.self) continue;
+      const uid = String(s.id);
+      if (seen.has(uid)) continue;
+      scanned++;
+      if (!passesHarvestFilter(s)) {
+        skipped++;
+        continue;
+      }
+      seen.set(uid, {
+        telegram_user_id: uid,
+        username: s.username || null,
+        first_name: s.firstName || null,
+        last_name: s.lastName || null,
+      });
+    }
+
+
+    const users = Array.from(seen.values());
+    // батчим по 500
+    for (let i = 0; i < users.length; i += 500) {
+      const chunk = users.slice(i, i + 500);
+      await api.harvestSubmit({
+        groupId: group.id,
+        title,
+        users: chunk,
+        done: i + 500 >= users.length,
+      });
+    }
+    if (users.length === 0) {
+      await api.harvestSubmit({ groupId: group.id, title, users: [], done: true });
+    }
+    log(account.id, "info", "harvest_done", { group: title, collected: users.length, scanned, skipped });
+  } catch (e) {
+    log(account.id, "error", "harvest_failed", { link: group.link, error: e.message });
+    await api.harvestSubmit({
+      groupId: group.id,
+      title,
+      users: [],
+      error: e.message.slice(0, 480),
+    }).catch(() => {});
+  }
+}
+
+async function harvestOnce() {
+  if (harvesting) return;
+  harvesting = true;
+  try {
+    const { groups } = await api.harvestTargets().catch(() => ({ groups: [] }));
+    for (const group of groups || []) {
+      const state = accounts.get(group.accountId);
+      if (!state?.client) continue;
+      await harvestGroup({ id: group.accountId }, state, group);
+      await sleep(jitter());
+    }
+  } catch (e) {
+    console.error("harvest error:", e.message);
+  } finally {
+    harvesting = false;
   }
 }
 
@@ -339,6 +863,14 @@ async function main() {
       await sleep(PULL_INTERVAL_MS);
     }
   })();
+
+  // Harvest loop — собираем активных авторов из указанных групп
+  (async () => {
+    while (true) {
+      await harvestOnce().catch((e) => console.error("harvest loop error:", e));
+      await sleep(HARVEST_INTERVAL_MS);
+    }
+  })();
 }
 
 main();
@@ -347,7 +879,7 @@ process.on("SIGTERM", async () => {
   console.log("Shutting down...");
   for (const [id, state] of accounts.entries()) {
     if (state.client) {
-      await api.heartbeat(id, "offline").catch(() => {});
+      await api.heartbeat(id, "disconnected").catch(() => {});
       await state.client.disconnect().catch(() => {});
     }
   }
