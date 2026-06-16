@@ -44,7 +44,7 @@ const accounts = new Map();
 const pendingLoginClients = new Map();
 const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000;
 
-async function getOrCreateLoginClient(accountId, sessionString = "") {
+async function getOrCreateLoginClient(accountId, sessionString = "", proxy = null) {
   const existing = pendingLoginClients.get(accountId);
   if (existing && existing.expiresAt > Date.now()) {
     return existing.client;
@@ -53,7 +53,7 @@ async function getOrCreateLoginClient(accountId, sessionString = "") {
     await existing.client.disconnect().catch(() => {});
     pendingLoginClients.delete(accountId);
   }
-  const client = await newClient(sessionString || "");
+  const client = await newClient(sessionString || "", proxy);
   await client.connect();
   pendingLoginClients.set(accountId, {
     client,
@@ -77,21 +77,61 @@ function log(accountId, level, event, data) {
   }
 }
 
-async function newClient(sessionString = "") {
+/**
+ * Сигнал о состоянии соединения аккаунта (вероятная пропажа/возврат прокси).
+ * Шлём на сервер только на ПЕРЕХОДАХ (down<->restored), чтобы не спамить
+ * HTTP-ом каждый цикл синхронизации. Идемпотентность дополнительно держится
+ * на сервере.
+ */
+function setConnAlert(account, state, kind, error) {
+  if (state.connAlert === kind) return;
+  state.connAlert = kind;
+  api.connectionAlert(account.id, kind, error).catch(() => {});
+}
+
+// Преобразует прокси из БД (host/port/username/password) в формат gramjs SOCKS5.
+function toGramProxy(proxy) {
+  if (!proxy || !proxy.host || !proxy.port) return undefined;
+  const p = {
+    ip: proxy.host,
+    port: Number(proxy.port),
+    socksType: 5,
+  };
+  if (proxy.username) p.username = proxy.username;
+  if (proxy.password) p.password = proxy.password;
+  return p;
+}
+
+async function newClient(sessionString = "", proxy = null) {
   const session = new StringSession(sessionString);
-  const client = new TelegramClient(session, apiId, apiHash, {
+  const gramProxy = toGramProxy(proxy);
+  const opts = {
     connectionRetries: 5,
     autoReconnect: true,
-  });
+  };
+  if (gramProxy) opts.proxy = gramProxy;
+  const client = new TelegramClient(session, apiId, apiHash, opts);
   return client;
 }
 
 async function startConnectedClient(state, account) {
-  const client = await newClient(account.session_string);
-  await client.connect();
-  const me = await client.getMe();
+  const client = await newClient(account.session_string, account.proxy);
+  let me;
+  try {
+    await client.connect();
+    me = await client.getMe();
+  } catch (e) {
+    // Не удалось подключиться — почти всегда это умерший/кончившийся прокси
+    // (трафик идёт через него). Сообщаем админу и пробуем ещё раз позже.
+    await client.disconnect().catch(() => {});
+    setConnAlert(account, state, "down", e.message);
+    throw e;
+  }
+  // Подключение живо — если до этого падало, сообщаем что прокси снова работает.
+  setConnAlert(account, state, "restored");
   state.client = client;
   state.me = me;
+
 
   // Прогреваем поток updates И populate-им entity-кэш (access_hash) для всех
   // диалогов аккаунта. Без этого getEntity(BigInt(userId)) для контактов, с
@@ -262,7 +302,7 @@ async function handleLoginRequested(account) {
   log(account.id, "info", "sending_code", { phone: account.phone });
   // Сбрасываем предыдущую попытку логина (если была)
   await disposeLoginClient(account.id);
-  const client = await getOrCreateLoginClient(account.id);
+  const client = await getOrCreateLoginClient(account.id, "", account.proxy);
   try {
     const result = await client.invoke(
       new Api.auth.SendCode({
@@ -318,7 +358,7 @@ async function handleCodeSubmitted(account) {
     });
     return;
   }
-  const client = await getOrCreateLoginClient(account.id, account.session_string || "");
+  const client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
   try {
     await client.invoke(
       new Api.auth.SignIn({
@@ -374,7 +414,7 @@ async function handlePasswordSubmitted(account) {
     });
     return;
   }
-  const client = await getOrCreateLoginClient(account.id, account.session_string || "");
+  const client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
   try {
     const pwd = await client.invoke(new Api.account.GetPassword());
     const check = await computeCheck(pwd, account.pending_password);
@@ -619,9 +659,19 @@ async function syncOnce() {
     }
 
     // Heartbeat for connected
-    if (state.client && Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
-      state.lastHeartbeat = Date.now();
-      api.heartbeat(account.id, "connected").catch(() => {});
+    if (state.client) {
+      // Если соединение разорвалось посреди сессии (умер прокси) — gramjs
+      // выставляет client.connected=false. Это тоже "пропажа прокси".
+      if (state.client.connected === false) {
+        setConnAlert(account, state, "down", "connection dropped");
+      } else if (state.connAlert === "down") {
+        // Авто-reconnect поднял соединение обратно.
+        setConnAlert(account, state, "restored");
+      }
+      if (Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
+        state.lastHeartbeat = Date.now();
+        api.heartbeat(account.id, "connected").catch(() => {});
+      }
     }
   }
 

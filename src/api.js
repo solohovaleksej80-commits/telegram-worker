@@ -69,6 +69,12 @@ export const api = {
   }),
   log: (accountId, level, event, data) =>
     call("/api/public/worker/log", { accountId, level, event, data }),
+  connectionAlert: (accountId, state, error) =>
+    call("/api/public/worker/connection-alert", {
+      account_id: accountId,
+      state,
+      error: error ? String(error).slice(0, 500) : undefined,
+    }),
   harvestTargets: () => call("/api/public/worker/harvest-targets", {}),
   harvestSubmit: (payload) => call("/api/public/worker/harvest-submit", payload),
 };
