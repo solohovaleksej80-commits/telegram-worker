@@ -17,9 +17,10 @@ const PULL_INTERVAL_MS = Number(process.env.PULL_INTERVAL_MS || 5000);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 30000);
 const MIN_DELAY = Number(process.env.MIN_SEND_DELAY_MS || 8000);
 const MAX_DELAY = Number(process.env.MAX_SEND_DELAY_MS || 20000);
-const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 25000);
+const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 45000);
 const TELEGRAM_REQUEST_TIMEOUT_MS = Number(process.env.TELEGRAM_REQUEST_TIMEOUT_MS || 30000);
-const ACCOUNT_STEP_TIMEOUT_MS = Number(process.env.ACCOUNT_STEP_TIMEOUT_MS || 45000);
+const ACCOUNT_STEP_TIMEOUT_MS = Number(process.env.ACCOUNT_STEP_TIMEOUT_MS || 90000);
+const CONNECTION_FAILURES_BEFORE_ALERT = Number(process.env.CONNECTION_FAILURES_BEFORE_ALERT || 3);
 
 for (const [k, v] of Object.entries({
   TELEGRAM_API_ID, TELEGRAM_API_HASH, LOVABLE_BASE_URL, WORKER_SECRET,
@@ -108,8 +109,17 @@ function log(accountId, level, event, data) {
  * на сервере.
  */
 function setConnAlert(account, state, kind, error) {
-  if (state.connAlert === kind) return;
-  state.connAlert = kind;
+  if (kind === "down") {
+    state.connectionFailures = (state.connectionFailures || 0) + 1;
+    if (state.connectionFailures < CONNECTION_FAILURES_BEFORE_ALERT) return;
+    if (state.connAlert === "down") return;
+    state.connAlert = "down";
+    api.connectionAlert(account.id, kind, error).catch(() => {});
+    return;
+  }
+  state.connectionFailures = 0;
+  if (state.connAlert !== "down") return;
+  state.connAlert = "restored";
   api.connectionAlert(account.id, kind, error).catch(() => {});
 }
 
@@ -120,6 +130,7 @@ function toGramProxy(proxy) {
     ip: proxy.host,
     port: Number(proxy.port),
     socksType: 5,
+    timeout: Math.max(10, Math.ceil(CONNECT_TIMEOUT_MS / 1000)),
   };
   if (proxy.username) p.username = proxy.username;
   if (proxy.password) p.password = proxy.password;
@@ -132,6 +143,7 @@ async function newClient(sessionString = "", proxy = null) {
   const opts = {
     connectionRetries: 5,
     autoReconnect: true,
+    useWSS: false,
   };
   if (gramProxy) opts.proxy = gramProxy;
   const client = new TelegramClient(session, apiId, apiHash, opts);
@@ -326,8 +338,9 @@ async function handleLoginRequested(account) {
   log(account.id, "info", "sending_code", { phone: account.phone });
   // Сбрасываем предыдущую попытку логина (если была)
   await disposeLoginClient(account.id);
-  const client = await getOrCreateLoginClient(account.id, "", account.proxy);
+  let client;
   try {
+    client = await getOrCreateLoginClient(account.id, "", account.proxy);
     const result = await telegramRequest(client.invoke(
       new Api.auth.SendCode({
         phoneNumber: account.phone,
@@ -382,8 +395,9 @@ async function handleCodeSubmitted(account) {
     });
     return;
   }
-  const client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
+  let client;
   try {
+    client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
     await telegramRequest(client.invoke(
       new Api.auth.SignIn({
         phoneNumber: account.phone,
@@ -438,8 +452,9 @@ async function handlePasswordSubmitted(account) {
     });
     return;
   }
-  const client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
+  let client;
   try {
+    client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
     const pwd = await telegramRequest(
       client.invoke(new Api.account.GetPassword()),
       `getPassword ${account.id.slice(0, 8)}`,
@@ -465,7 +480,7 @@ async function handlePasswordSubmitted(account) {
     await api.updateAccount({
       account_id: account.id,
       status: "password_required",
-      session_string: client.session.save(),
+      session_string: client ? client.session.save() : account.session_string || null,
       last_error: `2fa: ${e.message || e.errorMessage}`,
       clear_pending_password: true,
     });
