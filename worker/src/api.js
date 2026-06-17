@@ -25,56 +25,17 @@ export const api = {
   accounts: () => call("/api/public/worker/accounts", {}),
   updateAccount: (payload) => call("/api/public/worker/account-update", payload),
   heartbeat: (accountId, status = "connected") =>
-    call("/api/public/worker/heartbeat", { accountId, status }),
+    call("/api/public/worker/heartbeat", { account_id: accountId, status }),
   pull: (accountId, limit = 5) =>
-    call("/api/public/worker/pull", { accountId, limit }),
-  ack: (queueId, success, error, resolvedTelegramUserId, spamBotResult) =>
+    call("/api/public/worker/pull", { account_id: accountId, limit }),
+  ack: (messageId, success, error, telegramMessageId) =>
     call("/api/public/worker/ack", {
-      queueId,
+      message_id: messageId,
       success,
       error,
-      resolvedTelegramUserId,
-      spamBotResult: spamBotResult || undefined,
+      telegram_message_id: telegramMessageId,
     }),
-  inbound: (payload) => call("/api/public/worker/inbound", {
-    accountId: payload.account_id,
-    telegramUserId: payload.telegram_user_id,
-    username: payload.username,
-    firstName: payload.first_name,
-    lastName: payload.last_name,
-    text: payload.text,
-    mediaType: payload.media_type || null,
-    telegramMessageId: payload.telegram_message_id != null ? String(payload.telegram_message_id) : null,
-    reply_to_story: payload.reply_to_story,
-    story_id: payload.story_id,
-  }),
-  outbound: (payload) => call("/api/public/worker/outbound", {
-    accountId: payload.account_id,
-    telegramUserId: payload.telegram_user_id,
-    username: payload.username,
-    firstName: payload.first_name,
-    lastName: payload.last_name,
-    text: payload.text,
-    telegramMessageId: payload.telegram_message_id != null ? String(payload.telegram_message_id) : null,
-  }),
-  inboundReaction: (payload) => call("/api/public/worker/inbound", {
-    kind: "reaction",
-    accountId: payload.account_id,
-    telegramUserId: payload.telegram_user_id,
-    username: payload.username,
-    firstName: payload.first_name,
-    lastName: payload.last_name,
-    emoji: payload.emoji,
-    msgId: payload.msg_id != null ? String(payload.msg_id) : null,
-  }),
+  inbound: (payload) => call("/api/public/worker/inbound", payload),
   log: (accountId, level, event, data) =>
-    call("/api/public/worker/log", { accountId, level, event, data }),
-  connectionAlert: (accountId, state, error) =>
-    call("/api/public/worker/connection-alert", {
-      account_id: accountId,
-      state,
-      error: error ? String(error).slice(0, 500) : undefined,
-    }),
-  harvestTargets: () => call("/api/public/worker/harvest-targets", {}),
-  harvestSubmit: (payload) => call("/api/public/worker/harvest-submit", payload),
+    call("/api/public/worker/log", { account_id: accountId, level, event, data }),
 };

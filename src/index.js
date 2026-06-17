@@ -3,7 +3,6 @@ import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import { NewMessage } from "telegram/events/index.js";
 import { computeCheck } from "telegram/Password.js";
-import { SocksClient } from "socks";
 import { api } from "./api.js";
 
 const {
@@ -18,11 +17,6 @@ const PULL_INTERVAL_MS = Number(process.env.PULL_INTERVAL_MS || 5000);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 30000);
 const MIN_DELAY = Number(process.env.MIN_SEND_DELAY_MS || 8000);
 const MAX_DELAY = Number(process.env.MAX_SEND_DELAY_MS || 20000);
-const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 45000);
-const TELEGRAM_REQUEST_TIMEOUT_MS = Number(process.env.TELEGRAM_REQUEST_TIMEOUT_MS || 30000);
-const ACCOUNT_STEP_TIMEOUT_MS = Number(process.env.ACCOUNT_STEP_TIMEOUT_MS || 90000);
-const CONNECTION_FAILURES_BEFORE_ALERT = Number(process.env.CONNECTION_FAILURES_BEFORE_ALERT || 3);
-const SMS_RESEND_AFTER_MS = Number(process.env.SMS_RESEND_AFTER_MS || 65000);
 
 for (const [k, v] of Object.entries({
   TELEGRAM_API_ID, TELEGRAM_API_HASH, LOVABLE_BASE_URL, WORKER_SECRET,
@@ -35,45 +29,6 @@ const apiHash = TELEGRAM_API_HASH;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = () => MIN_DELAY + Math.floor(Math.random() * (MAX_DELAY - MIN_DELAY));
-
-function withTimeout(promise, ms, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-async function connectClient(client, label = "telegram connect") {
-  try {
-    await withTimeout(client.connect(), CONNECT_TIMEOUT_MS, label);
-  } catch (e) {
-    await client.disconnect().catch(() => {});
-    throw e;
-  }
-}
-
-function telegramRequest(promise, label) {
-  return withTimeout(promise, TELEGRAM_REQUEST_TIMEOUT_MS, label);
-}
-
-function isConnectionIssue(error) {
-  const s = String(error?.message || error || "").toLowerCase();
-  return (
-    s.includes("timeout") ||
-    s.includes("socks") ||
-    s.includes("proxy") ||
-    s.includes("econn") ||
-    s.includes("enet") ||
-    s.includes("socket") ||
-    s.includes("connection")
-  );
-}
-
-function proxyKey(proxy) {
-  if (!proxy || !proxy.host || !proxy.port) return "direct";
-  return `${proxy.host}:${proxy.port}:${proxy.username || ""}`;
-}
 
 /**
  * State per account:
@@ -89,20 +44,19 @@ const accounts = new Map();
 const pendingLoginClients = new Map();
 const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000;
 
-async function getOrCreateLoginClient(accountId, sessionString = "", proxy = null) {
+async function getOrCreateLoginClient(accountId, sessionString = "") {
   const existing = pendingLoginClients.get(accountId);
-  if (existing && existing.expiresAt > Date.now() && existing.proxyKey === proxyKey(proxy)) {
+  if (existing && existing.expiresAt > Date.now()) {
     return existing.client;
   }
   if (existing) {
     await existing.client.disconnect().catch(() => {});
     pendingLoginClients.delete(accountId);
   }
-  const client = await newClient(sessionString || "", proxy);
-  await connectClient(client, `login connect ${accountId.slice(0, 8)}`);
+  const client = await newClient(sessionString || "");
+  await client.connect();
   pendingLoginClients.set(accountId, {
     client,
-    proxyKey: proxyKey(proxy),
     expiresAt: Date.now() + PENDING_LOGIN_TTL_MS,
   });
   return client;
@@ -123,148 +77,28 @@ function log(accountId, level, event, data) {
   }
 }
 
-/**
- * Проверка живости прокси через 3 разных Telegram DC (DC2/DC4/DC5).
- * Кратковременный сбой между воркером и одним DC НЕ должен помечать живой
- * прокси мёртвым: прокси = dead только если все 3 TCP-коннекта провалились.
- */
-const TG_DC_TARGETS = [
-  { host: "149.154.167.51", port: 443 }, // DC2
-  { host: "149.154.167.91", port: 443 }, // DC4
-  { host: "91.108.56.130", port: 443 },  // DC5
-];
-
-async function checkProxy(proxy) {
-  if (!proxy || !proxy.host || !proxy.port) {
-    return { ok: false, error: "proxy not configured" };
-  }
-  let lastErr = null;
-  for (const dc of TG_DC_TARGETS) {
-    try {
-      const info = await SocksClient.createConnection({
-        proxy: {
-          host: proxy.host,
-          port: Number(proxy.port),
-          type: 5,
-          userId: proxy.username || undefined,
-          password: proxy.password || undefined,
-        },
-        command: "connect",
-        destination: { host: dc.host, port: dc.port },
-        timeout: 15000,
-      });
-      try { info.socket.destroy(); } catch { /* ignore */ }
-      return { ok: true, error: null };
-    } catch (e) {
-      lastErr = `${dc.host}: ${String(e?.message || e).slice(0, 150)}`;
-      await sleep(1000);
-    }
-  }
-  return { ok: false, error: (lastErr || "all DC unreachable").slice(0, 300) };
-}
-
-/**
- * Сигнал о состоянии соединения аккаунта (вероятная пропажа/возврат прокси).
- * Шлём на сервер только на ПЕРЕХОДАХ (down<->restored), чтобы не спамить
- * HTTP-ом каждый цикл синхронизации. Идемпотентность дополнительно держится
- * на сервере.
- *
- * Перед сигналом "down" дополнительно проверяем прокси по 3 DC — если он
- * реально жив, ошибка была кратковременной, и мы НЕ тревожим админа.
- */
-async function setConnAlert(account, state, kind, error, opts = {}) {
-  if (kind === "down") {
-    state.connectionFailures = (state.connectionFailures || 0) + 1;
-    if (!opts.force && state.connectionFailures < CONNECTION_FAILURES_BEFORE_ALERT) return;
-    if (state.connAlert === "down") return;
-    if (!opts.skipProxyCheck && account.proxy && account.proxy.host) {
-      const res = await checkProxy(account.proxy);
-      if (res.ok) {
-        // прокси жив — это был кратковременный сбой, не тревожим
-        state.connectionFailures = 0;
-        log(account.id, "warn", "proxy_alive_transient_error", { error });
-        return;
-      }
-      error = res.error || error;
-    }
-    state.connAlert = "down";
-    try {
-      return await api.connectionAlert(account.id, kind, error);
-    } catch (e) {
-      log(account.id, "error", "connection_alert_failed", { error: e.message });
-      return null;
-    }
-  }
-  state.connectionFailures = 0;
-  if (state.connAlert !== "down") return;
-  state.connAlert = "restored";
-  try {
-    return await api.connectionAlert(account.id, kind, error);
-  } catch (e) {
-    log(account.id, "error", "connection_alert_failed", { error: e.message });
-    return null;
-  }
-}
-
-// Преобразует прокси из БД (host/port/username/password) в формат gramjs SOCKS5.
-function toGramProxy(proxy) {
-  if (!proxy || !proxy.host || !proxy.port) return undefined;
-  const p = {
-    ip: proxy.host,
-    port: Number(proxy.port),
-    socksType: 5,
-    timeout: Math.max(10, Math.ceil(CONNECT_TIMEOUT_MS / 1000)),
-  };
-  if (proxy.username) p.username = proxy.username;
-  if (proxy.password) p.password = proxy.password;
-  return p;
-}
-
-async function newClient(sessionString = "", proxy = null) {
+async function newClient(sessionString = "") {
   const session = new StringSession(sessionString);
-  const gramProxy = toGramProxy(proxy);
-  const opts = {
-    connectionRetries: 2,
-    requestRetries: 1,
+  const client = new TelegramClient(session, apiId, apiHash, {
+    connectionRetries: 5,
     autoReconnect: true,
-    timeout: Math.max(10, Math.ceil(CONNECT_TIMEOUT_MS / 1000)),
-    useWSS: true,
-  };
-  if (gramProxy) opts.proxy = gramProxy;
-  const client = new TelegramClient(session, apiId, apiHash, opts);
+  });
   return client;
 }
 
 async function startConnectedClient(state, account) {
-  const client = await newClient(account.session_string, account.proxy);
-  let me;
-  try {
-    await connectClient(client, `connect ${account.id.slice(0, 8)}`);
-    me = await telegramRequest(client.getMe(), `getMe ${account.id.slice(0, 8)}`);
-  } catch (e) {
-    // Не удалось подключиться — почти всегда это умерший/кончившийся прокси
-    // (трафик идёт через него). Сообщаем админу и пробуем ещё раз позже.
-    await client.disconnect().catch(() => {});
-    const alert = await setConnAlert(account, state, "down", e.message, { skipProxyCheck: true });
-    if (alert?.newProxyId) {
-      state.connAlert = null;
-      state.connectionFailures = 0;
-    }
-    throw e;
-  }
-  // Подключение живо — если до этого падало, сообщаем что прокси снова работает.
-  await setConnAlert(account, state, "restored");
+  const client = await newClient(account.session_string);
+  await client.connect();
+  const me = await client.getMe();
   state.client = client;
   state.me = me;
-  state.activeProxyKey = proxyKey(account.proxy);
-
 
   // Прогреваем поток updates И populate-им entity-кэш (access_hash) для всех
   // диалогов аккаунта. Без этого getEntity(BigInt(userId)) для контактов, с
   // которыми бот ещё не переписывался через эту сессию, падает с
   // "Could not find the input entity for PeerUser" — и ссылка не уходит.
   try {
-    await telegramRequest(client.getDialogs({ limit: 200 }), `getDialogs ${account.id.slice(0, 8)}`);
+    await client.getDialogs({ limit: 200 });
   } catch (e) {
     log(account.id, "warn", "warmup_dialogs_failed", { error: e.message });
   }
@@ -417,36 +251,31 @@ async function startConnectedClient(state, account) {
   });
 
   // Update display_name on first connect
-  await telegramRequest(api.updateAccount({
+  await api.updateAccount({
     account_id: account.id,
     status: "connected",
     display_name: me.username || me.firstName || account.phone,
-  }), `updateAccount connected ${account.id.slice(0, 8)}`);
+  });
 }
 
-async function handleLoginRequested(account, state = {}) {
+async function handleLoginRequested(account) {
   log(account.id, "info", "sending_code", { phone: account.phone });
   // Сбрасываем предыдущую попытку логина (если была)
   await disposeLoginClient(account.id);
-  let client;
+  const client = await getOrCreateLoginClient(account.id);
   try {
-    // Логин идём ПРЯМЫМ IP сервера (без прокси): SendCode/SignIn так доходят
-    // быстро и надёжно. Прокси подключается только после статуса connected
-    // (для рабочего трафика, где важна защита от банов).
-    client = await getOrCreateLoginClient(account.id, "", null);
-    const result = await telegramRequest(client.invoke(
+    const result = await client.invoke(
       new Api.auth.SendCode({
         phoneNumber: account.phone,
         apiId,
         apiHash,
         settings: new Api.CodeSettings({
           allowFlashcall: false,
-          currentNumber: false,
+          currentNumber: true,
           allowAppHash: false,
-          allowMissedCall: false,
         }),
       }),
-    ), `sendCode ${account.id.slice(0, 8)}`);
+    );
     await api.updateAccount({
       account_id: account.id,
       status: "code_sent",
@@ -454,64 +283,15 @@ async function handleLoginRequested(account, state = {}) {
       pending_phone_code_hash: result.phoneCodeHash,
       last_error: null,
     });
-    log(account.id, "info", "code_sent", {
-      type: result.type?.className || null,
-      nextType: result.nextType?.className || null,
-      timeout: result.timeout || null,
-    });
+    log(account.id, "info", "code_sent", null);
   } catch (e) {
     await disposeLoginClient(account.id);
-    // Логин идёт без прокси, поэтому ротация прокси здесь не нужна.
     await api.updateAccount({
       account_id: account.id,
       status: "error",
       last_error: `sendCode: ${e.message}`,
     });
     log(account.id, "error", "send_code_failed", { error: e.message });
-  }
-}
-
-async function handleCodeSentWaiting(account, state = {}) {
-  if (!account.pending_phone_code_hash) return;
-  if (state.smsResentHash === account.pending_phone_code_hash) return;
-  const since = account.updated_at ? Date.parse(account.updated_at) : Date.now();
-  const age = Date.now() - since;
-  if (age < SMS_RESEND_AFTER_MS) return;
-
-  let client;
-  try {
-    client = await getOrCreateLoginClient(account.id, account.session_string || "", null);
-    const result = await telegramRequest(
-      client.invoke(
-        new Api.auth.ResendCode({
-          phoneNumber: account.phone,
-          phoneCodeHash: account.pending_phone_code_hash,
-        }),
-      ),
-      `resendCode ${account.id.slice(0, 8)}`,
-    );
-    const nextHash = result.phoneCodeHash || account.pending_phone_code_hash;
-    state.smsResentHash = nextHash;
-    await api.updateAccount({
-      account_id: account.id,
-      status: "code_sent",
-      session_string: client.session.save(),
-      pending_phone_code_hash: nextHash,
-      last_error: null,
-    });
-    log(account.id, "info", "sms_resend_requested", {
-      type: result.type?.className || null,
-      nextType: result.nextType?.className || null,
-      timeout: result.timeout || null,
-    });
-  } catch (e) {
-    state.smsResentHash = account.pending_phone_code_hash;
-    await api.updateAccount({
-      account_id: account.id,
-      status: "code_sent",
-      last_error: `resendCode: ${e.message || e.errorMessage}`,
-    }).catch(() => {});
-    log(account.id, "error", "sms_resend_failed", { error: e.message || e.errorMessage });
   }
 }
 
@@ -538,16 +318,15 @@ async function handleCodeSubmitted(account) {
     });
     return;
   }
-  let client;
+  const client = await getOrCreateLoginClient(account.id, account.session_string || "");
   try {
-    client = await getOrCreateLoginClient(account.id, account.session_string || "", null);
-    await telegramRequest(client.invoke(
+    await client.invoke(
       new Api.auth.SignIn({
         phoneNumber: account.phone,
         phoneCodeHash: account.pending_phone_code_hash,
         phoneCode: account.pending_code,
       }),
-    ), `signIn ${account.id.slice(0, 8)}`);
+    );
     // Success без 2FA
     const sessionString = client.session.save();
     await api.updateAccount({
@@ -595,18 +374,11 @@ async function handlePasswordSubmitted(account) {
     });
     return;
   }
-  let client;
+  const client = await getOrCreateLoginClient(account.id, account.session_string || "");
   try {
-    client = await getOrCreateLoginClient(account.id, account.session_string || "", null);
-    const pwd = await telegramRequest(
-      client.invoke(new Api.account.GetPassword()),
-      `getPassword ${account.id.slice(0, 8)}`,
-    );
+    const pwd = await client.invoke(new Api.account.GetPassword());
     const check = await computeCheck(pwd, account.pending_password);
-    await telegramRequest(
-      client.invoke(new Api.auth.CheckPassword({ password: check })),
-      `checkPassword ${account.id.slice(0, 8)}`,
-    );
+    await client.invoke(new Api.auth.CheckPassword({ password: check }));
     const sessionString = client.session.save();
     await api.updateAccount({
       account_id: account.id,
@@ -623,7 +395,7 @@ async function handlePasswordSubmitted(account) {
     await api.updateAccount({
       account_id: account.id,
       status: "password_required",
-      session_string: client ? client.session.save() : account.session_string || null,
+      session_string: client.session.save(),
       last_error: `2fa: ${e.message || e.errorMessage}`,
       clear_pending_password: true,
     });
@@ -811,90 +583,45 @@ async function syncOnce() {
     seen.add(account.id);
     let state = accounts.get(account.id);
     if (!state) {
-      state = { busy: false, pulling: false, lastHeartbeat: 0, stepStartedAt: 0 };
+      state = { busy: false, pulling: false, lastHeartbeat: 0 };
       accounts.set(account.id, state);
-    }
-    if (state.busy && Date.now() - (state.stepStartedAt || 0) > ACCOUNT_STEP_TIMEOUT_MS * 2) {
-      log(account.id, "warn", "state_unstuck", { status: account.status });
-      state.busy = false;
     }
     if (state.busy) continue;
     state.busy = true;
-    state.stepStartedAt = Date.now();
-    if (
-      (account.status === "connected" || account.status === "active") &&
-      state.client &&
-      state.activeProxyKey !== proxyKey(account.proxy)
-    ) {
-      log(account.id, "info", "proxy_changed_reconnect", {
-        from: state.activeProxyKey || "direct",
-        to: proxyKey(account.proxy),
-      });
-      await state.client.disconnect().catch(() => {});
-      state.client = null;
-      state.activeProxyKey = null;
-    }
-    const shouldPingWhileWorking =
-      account.status === "login_requested" ||
-      account.status === "code_sent" ||
-      account.status === "code_submitted" ||
-      account.status === "password_required" ||
-      account.status === "password_submitted" ||
-      account.status === "connected" ||
-      account.status === "active";
-    if (shouldPingWhileWorking && Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
-      state.lastHeartbeat = Date.now();
-      api.heartbeat(account.id, account.status).catch(() => {});
-    }
 
     try {
       // State machine
       if (account.status === "login_requested") {
-        await withTimeout(handleLoginRequested(account, state), ACCOUNT_STEP_TIMEOUT_MS, `login_requested ${account.id.slice(0, 8)}`);
-      } else if (account.status === "code_sent") {
-        await withTimeout(handleCodeSentWaiting(account, state), ACCOUNT_STEP_TIMEOUT_MS, `code_sent ${account.id.slice(0, 8)}`);
+        await handleLoginRequested(account);
       } else if (account.status === "code_submitted" && account.pending_code) {
-        await withTimeout(handleCodeSubmitted(account), ACCOUNT_STEP_TIMEOUT_MS, `code_submitted ${account.id.slice(0, 8)}`);
+        await handleCodeSubmitted(account);
       } else if (account.status === "password_submitted" && account.pending_password) {
-        await withTimeout(handlePasswordSubmitted(account), ACCOUNT_STEP_TIMEOUT_MS, `password_submitted ${account.id.slice(0, 8)}`);
+        await handlePasswordSubmitted(account);
       } else if (
         (account.status === "connected" || account.status === "active") &&
         account.session_string &&
         !state.client
       ) {
-        await withTimeout(startConnectedClient(state, account), ACCOUNT_STEP_TIMEOUT_MS, `start_connected ${account.id.slice(0, 8)}`);
+        await startConnectedClient(state, account);
       } else if (account.status === "paused" && state.client) {
         // Disconnect client when paused
         await state.client.disconnect().catch(() => {});
         state.client = null;
-        state.activeProxyKey = null;
         log(account.id, "info", "paused", null);
       } else if (account.status === "disconnected" && state.client) {
         await state.client.disconnect().catch(() => {});
         state.client = null;
-        state.activeProxyKey = null;
       }
     } catch (e) {
       log(account.id, "error", "state_handler_failed", { status: account.status, error: e.message });
     } finally {
       state.busy = false;
-      state.stepStartedAt = 0;
     }
 
     // Heartbeat for connected
-    if (state.client) {
-      // Если соединение разорвалось посреди сессии (умер прокси) — gramjs
-      // выставляет client.connected=false. Это тоже "пропажа прокси".
-      if (state.client.connected === false) {
-        await setConnAlert(account, state, "down", "connection dropped");
-      } else if (state.connAlert === "down") {
-        // Авто-reconnect поднял соединение обратно.
-        await setConnAlert(account, state, "restored");
-      }
-      if (Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
-        state.lastHeartbeat = Date.now();
-        api.heartbeat(account.id, account.status).catch(() => {});
-      }
+    if (state.client && Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
+      state.lastHeartbeat = Date.now();
+      api.heartbeat(account.id, "connected").catch(() => {});
     }
   }
 
