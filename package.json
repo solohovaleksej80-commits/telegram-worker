@@ -13,6 +13,7 @@
   "dependencies": {
     "telegram": "^2.26.16",
     "node-fetch": "^3.3.2",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "socks": "^2.8.3"
   }
 }

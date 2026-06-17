@@ -3,6 +3,7 @@ import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import { NewMessage } from "telegram/events/index.js";
 import { computeCheck } from "telegram/Password.js";
+import { SocksClient } from "socks";
 import { api } from "./api.js";
 
 const {
@@ -55,6 +56,24 @@ function telegramRequest(promise, label) {
   return withTimeout(promise, TELEGRAM_REQUEST_TIMEOUT_MS, label);
 }
 
+function isConnectionIssue(error) {
+  const s = String(error?.message || error || "").toLowerCase();
+  return (
+    s.includes("timeout") ||
+    s.includes("socks") ||
+    s.includes("proxy") ||
+    s.includes("econn") ||
+    s.includes("enet") ||
+    s.includes("socket") ||
+    s.includes("connection")
+  );
+}
+
+function proxyKey(proxy) {
+  if (!proxy || !proxy.host || !proxy.port) return "direct";
+  return `${proxy.host}:${proxy.port}:${proxy.username || ""}`;
+}
+
 /**
  * State per account:
  *   { client, status, busy, pulling, heartbeat }
@@ -71,7 +90,7 @@ const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000;
 
 async function getOrCreateLoginClient(accountId, sessionString = "", proxy = null) {
   const existing = pendingLoginClients.get(accountId);
-  if (existing && existing.expiresAt > Date.now()) {
+  if (existing && existing.expiresAt > Date.now() && existing.proxyKey === proxyKey(proxy)) {
     return existing.client;
   }
   if (existing) {
@@ -82,6 +101,7 @@ async function getOrCreateLoginClient(accountId, sessionString = "", proxy = nul
   await connectClient(client, `login connect ${accountId.slice(0, 8)}`);
   pendingLoginClients.set(accountId, {
     client,
+    proxyKey: proxyKey(proxy),
     expiresAt: Date.now() + PENDING_LOGIN_TTL_MS,
   });
   return client;
@@ -103,24 +123,86 @@ function log(accountId, level, event, data) {
 }
 
 /**
+ * Проверка живости прокси через 3 разных Telegram DC (DC2/DC4/DC5).
+ * Кратковременный сбой между воркером и одним DC НЕ должен помечать живой
+ * прокси мёртвым: прокси = dead только если все 3 TCP-коннекта провалились.
+ */
+const TG_DC_TARGETS = [
+  { host: "149.154.167.51", port: 443 }, // DC2
+  { host: "149.154.167.91", port: 443 }, // DC4
+  { host: "91.108.56.130", port: 443 },  // DC5
+];
+
+async function checkProxy(proxy) {
+  if (!proxy || !proxy.host || !proxy.port) {
+    return { ok: false, error: "proxy not configured" };
+  }
+  let lastErr = null;
+  for (const dc of TG_DC_TARGETS) {
+    try {
+      const info = await SocksClient.createConnection({
+        proxy: {
+          host: proxy.host,
+          port: Number(proxy.port),
+          type: 5,
+          userId: proxy.username || undefined,
+          password: proxy.password || undefined,
+        },
+        command: "connect",
+        destination: { host: dc.host, port: dc.port },
+        timeout: 15000,
+      });
+      try { info.socket.destroy(); } catch { /* ignore */ }
+      return { ok: true, error: null };
+    } catch (e) {
+      lastErr = `${dc.host}: ${String(e?.message || e).slice(0, 150)}`;
+      await sleep(1000);
+    }
+  }
+  return { ok: false, error: (lastErr || "all DC unreachable").slice(0, 300) };
+}
+
+/**
  * Сигнал о состоянии соединения аккаунта (вероятная пропажа/возврат прокси).
  * Шлём на сервер только на ПЕРЕХОДАХ (down<->restored), чтобы не спамить
  * HTTP-ом каждый цикл синхронизации. Идемпотентность дополнительно держится
  * на сервере.
+ *
+ * Перед сигналом "down" дополнительно проверяем прокси по 3 DC — если он
+ * реально жив, ошибка была кратковременной, и мы НЕ тревожим админа.
  */
-function setConnAlert(account, state, kind, error) {
+async function setConnAlert(account, state, kind, error, opts = {}) {
   if (kind === "down") {
     state.connectionFailures = (state.connectionFailures || 0) + 1;
-    if (state.connectionFailures < CONNECTION_FAILURES_BEFORE_ALERT) return;
+    if (!opts.force && state.connectionFailures < CONNECTION_FAILURES_BEFORE_ALERT) return;
     if (state.connAlert === "down") return;
+    if (!opts.skipProxyCheck && account.proxy && account.proxy.host) {
+      const res = await checkProxy(account.proxy);
+      if (res.ok) {
+        // прокси жив — это был кратковременный сбой, не тревожим
+        state.connectionFailures = 0;
+        log(account.id, "warn", "proxy_alive_transient_error", { error });
+        return;
+      }
+      error = res.error || error;
+    }
     state.connAlert = "down";
-    api.connectionAlert(account.id, kind, error).catch(() => {});
-    return;
+    try {
+      return await api.connectionAlert(account.id, kind, error);
+    } catch (e) {
+      log(account.id, "error", "connection_alert_failed", { error: e.message });
+      return null;
+    }
   }
   state.connectionFailures = 0;
   if (state.connAlert !== "down") return;
   state.connAlert = "restored";
-  api.connectionAlert(account.id, kind, error).catch(() => {});
+  try {
+    return await api.connectionAlert(account.id, kind, error);
+  } catch (e) {
+    log(account.id, "error", "connection_alert_failed", { error: e.message });
+    return null;
+  }
 }
 
 // Преобразует прокси из БД (host/port/username/password) в формат gramjs SOCKS5.
@@ -160,11 +242,15 @@ async function startConnectedClient(state, account) {
     // Не удалось подключиться — почти всегда это умерший/кончившийся прокси
     // (трафик идёт через него). Сообщаем админу и пробуем ещё раз позже.
     await client.disconnect().catch(() => {});
-    setConnAlert(account, state, "down", e.message);
+    const alert = await setConnAlert(account, state, "down", e.message, { skipProxyCheck: true });
+    if (alert?.newProxyId) {
+      state.connAlert = null;
+      state.connectionFailures = 0;
+    }
     throw e;
   }
   // Подключение живо — если до этого падало, сообщаем что прокси снова работает.
-  setConnAlert(account, state, "restored");
+  await setConnAlert(account, state, "restored");
   state.client = client;
   state.me = me;
 
@@ -334,13 +420,16 @@ async function startConnectedClient(state, account) {
   }), `updateAccount connected ${account.id.slice(0, 8)}`);
 }
 
-async function handleLoginRequested(account) {
+async function handleLoginRequested(account, state = {}) {
   log(account.id, "info", "sending_code", { phone: account.phone });
   // Сбрасываем предыдущую попытку логина (если была)
   await disposeLoginClient(account.id);
   let client;
   try {
-    client = await getOrCreateLoginClient(account.id, "", account.proxy);
+    // Логин идём ПРЯМЫМ IP сервера (без прокси): SendCode/SignIn так доходят
+    // быстро и надёжно. Прокси подключается только после статуса connected
+    // (для рабочего трафика, где важна защита от банов).
+    client = await getOrCreateLoginClient(account.id, "", null);
     const result = await telegramRequest(client.invoke(
       new Api.auth.SendCode({
         phoneNumber: account.phone,
@@ -363,6 +452,7 @@ async function handleLoginRequested(account) {
     log(account.id, "info", "code_sent", null);
   } catch (e) {
     await disposeLoginClient(account.id);
+    // Логин идёт без прокси, поэтому ротация прокси здесь не нужна.
     await api.updateAccount({
       account_id: account.id,
       status: "error",
@@ -397,7 +487,7 @@ async function handleCodeSubmitted(account) {
   }
   let client;
   try {
-    client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
+    client = await getOrCreateLoginClient(account.id, account.session_string || "", null);
     await telegramRequest(client.invoke(
       new Api.auth.SignIn({
         phoneNumber: account.phone,
@@ -454,7 +544,7 @@ async function handlePasswordSubmitted(account) {
   }
   let client;
   try {
-    client = await getOrCreateLoginClient(account.id, account.session_string || "", account.proxy);
+    client = await getOrCreateLoginClient(account.id, account.session_string || "", null);
     const pwd = await telegramRequest(
       client.invoke(new Api.account.GetPassword()),
       `getPassword ${account.id.slice(0, 8)}`,
@@ -682,7 +772,7 @@ async function syncOnce() {
     try {
       // State machine
       if (account.status === "login_requested") {
-        await withTimeout(handleLoginRequested(account), ACCOUNT_STEP_TIMEOUT_MS, `login_requested ${account.id.slice(0, 8)}`);
+        await withTimeout(handleLoginRequested(account, state), ACCOUNT_STEP_TIMEOUT_MS, `login_requested ${account.id.slice(0, 8)}`);
       } else if (account.status === "code_submitted" && account.pending_code) {
         await withTimeout(handleCodeSubmitted(account), ACCOUNT_STEP_TIMEOUT_MS, `code_submitted ${account.id.slice(0, 8)}`);
       } else if (account.status === "password_submitted" && account.pending_password) {
@@ -714,10 +804,10 @@ async function syncOnce() {
       // Если соединение разорвалось посреди сессии (умер прокси) — gramjs
       // выставляет client.connected=false. Это тоже "пропажа прокси".
       if (state.client.connected === false) {
-        setConnAlert(account, state, "down", "connection dropped");
+        await setConnAlert(account, state, "down", "connection dropped");
       } else if (state.connAlert === "down") {
         // Авто-reconnect поднял соединение обратно.
-        setConnAlert(account, state, "restored");
+        await setConnAlert(account, state, "restored");
       }
       if (Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
         state.lastHeartbeat = Date.now();
