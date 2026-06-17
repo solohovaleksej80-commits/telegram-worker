@@ -22,6 +22,7 @@ const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 45000);
 const TELEGRAM_REQUEST_TIMEOUT_MS = Number(process.env.TELEGRAM_REQUEST_TIMEOUT_MS || 30000);
 const ACCOUNT_STEP_TIMEOUT_MS = Number(process.env.ACCOUNT_STEP_TIMEOUT_MS || 90000);
 const CONNECTION_FAILURES_BEFORE_ALERT = Number(process.env.CONNECTION_FAILURES_BEFORE_ALERT || 3);
+const SMS_RESEND_AFTER_MS = Number(process.env.SMS_RESEND_AFTER_MS || 65000);
 
 for (const [k, v] of Object.entries({
   TELEGRAM_API_ID, TELEGRAM_API_HASH, LOVABLE_BASE_URL, WORKER_SECRET,
@@ -223,9 +224,11 @@ async function newClient(sessionString = "", proxy = null) {
   const session = new StringSession(sessionString);
   const gramProxy = toGramProxy(proxy);
   const opts = {
-    connectionRetries: 5,
+    connectionRetries: 2,
+    requestRetries: 1,
     autoReconnect: true,
-    useWSS: false,
+    timeout: Math.max(10, Math.ceil(CONNECT_TIMEOUT_MS / 1000)),
+    useWSS: true,
   };
   if (gramProxy) opts.proxy = gramProxy;
   const client = new TelegramClient(session, apiId, apiHash, opts);
@@ -253,6 +256,7 @@ async function startConnectedClient(state, account) {
   await setConnAlert(account, state, "restored");
   state.client = client;
   state.me = me;
+  state.activeProxyKey = proxyKey(account.proxy);
 
 
   // Прогреваем поток updates И populate-им entity-кэш (access_hash) для всех
@@ -437,8 +441,9 @@ async function handleLoginRequested(account, state = {}) {
         apiHash,
         settings: new Api.CodeSettings({
           allowFlashcall: false,
-          currentNumber: true,
+          currentNumber: false,
           allowAppHash: false,
+          allowMissedCall: false,
         }),
       }),
     ), `sendCode ${account.id.slice(0, 8)}`);
@@ -449,7 +454,11 @@ async function handleLoginRequested(account, state = {}) {
       pending_phone_code_hash: result.phoneCodeHash,
       last_error: null,
     });
-    log(account.id, "info", "code_sent", null);
+    log(account.id, "info", "code_sent", {
+      type: result.type?.className || null,
+      nextType: result.nextType?.className || null,
+      timeout: result.timeout || null,
+    });
   } catch (e) {
     await disposeLoginClient(account.id);
     // Логин идёт без прокси, поэтому ротация прокси здесь не нужна.
@@ -459,6 +468,50 @@ async function handleLoginRequested(account, state = {}) {
       last_error: `sendCode: ${e.message}`,
     });
     log(account.id, "error", "send_code_failed", { error: e.message });
+  }
+}
+
+async function handleCodeSentWaiting(account, state = {}) {
+  if (!account.pending_phone_code_hash) return;
+  if (state.smsResentHash === account.pending_phone_code_hash) return;
+  const since = account.updated_at ? Date.parse(account.updated_at) : Date.now();
+  const age = Date.now() - since;
+  if (age < SMS_RESEND_AFTER_MS) return;
+
+  let client;
+  try {
+    client = await getOrCreateLoginClient(account.id, account.session_string || "", null);
+    const result = await telegramRequest(
+      client.invoke(
+        new Api.auth.ResendCode({
+          phoneNumber: account.phone,
+          phoneCodeHash: account.pending_phone_code_hash,
+        }),
+      ),
+      `resendCode ${account.id.slice(0, 8)}`,
+    );
+    const nextHash = result.phoneCodeHash || account.pending_phone_code_hash;
+    state.smsResentHash = nextHash;
+    await api.updateAccount({
+      account_id: account.id,
+      status: "code_sent",
+      session_string: client.session.save(),
+      pending_phone_code_hash: nextHash,
+      last_error: null,
+    });
+    log(account.id, "info", "sms_resend_requested", {
+      type: result.type?.className || null,
+      nextType: result.nextType?.className || null,
+      timeout: result.timeout || null,
+    });
+  } catch (e) {
+    state.smsResentHash = account.pending_phone_code_hash;
+    await api.updateAccount({
+      account_id: account.id,
+      status: "code_sent",
+      last_error: `resendCode: ${e.message || e.errorMessage}`,
+    }).catch(() => {});
+    log(account.id, "error", "sms_resend_failed", { error: e.message || e.errorMessage });
   }
 }
 
@@ -768,11 +821,38 @@ async function syncOnce() {
     if (state.busy) continue;
     state.busy = true;
     state.stepStartedAt = Date.now();
+    if (
+      (account.status === "connected" || account.status === "active") &&
+      state.client &&
+      state.activeProxyKey !== proxyKey(account.proxy)
+    ) {
+      log(account.id, "info", "proxy_changed_reconnect", {
+        from: state.activeProxyKey || "direct",
+        to: proxyKey(account.proxy),
+      });
+      await state.client.disconnect().catch(() => {});
+      state.client = null;
+      state.activeProxyKey = null;
+    }
+    const shouldPingWhileWorking =
+      account.status === "login_requested" ||
+      account.status === "code_sent" ||
+      account.status === "code_submitted" ||
+      account.status === "password_required" ||
+      account.status === "password_submitted" ||
+      account.status === "connected" ||
+      account.status === "active";
+    if (shouldPingWhileWorking && Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
+      state.lastHeartbeat = Date.now();
+      api.heartbeat(account.id, account.status).catch(() => {});
+    }
 
     try {
       // State machine
       if (account.status === "login_requested") {
         await withTimeout(handleLoginRequested(account, state), ACCOUNT_STEP_TIMEOUT_MS, `login_requested ${account.id.slice(0, 8)}`);
+      } else if (account.status === "code_sent") {
+        await withTimeout(handleCodeSentWaiting(account, state), ACCOUNT_STEP_TIMEOUT_MS, `code_sent ${account.id.slice(0, 8)}`);
       } else if (account.status === "code_submitted" && account.pending_code) {
         await withTimeout(handleCodeSubmitted(account), ACCOUNT_STEP_TIMEOUT_MS, `code_submitted ${account.id.slice(0, 8)}`);
       } else if (account.status === "password_submitted" && account.pending_password) {
@@ -787,10 +867,12 @@ async function syncOnce() {
         // Disconnect client when paused
         await state.client.disconnect().catch(() => {});
         state.client = null;
+        state.activeProxyKey = null;
         log(account.id, "info", "paused", null);
       } else if (account.status === "disconnected" && state.client) {
         await state.client.disconnect().catch(() => {});
         state.client = null;
+        state.activeProxyKey = null;
       }
     } catch (e) {
       log(account.id, "error", "state_handler_failed", { status: account.status, error: e.message });
@@ -811,7 +893,7 @@ async function syncOnce() {
       }
       if (Date.now() - state.lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
         state.lastHeartbeat = Date.now();
-        api.heartbeat(account.id, "connected").catch(() => {});
+        api.heartbeat(account.id, account.status).catch(() => {});
       }
     }
   }
